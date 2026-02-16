@@ -5,7 +5,7 @@ from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
 from app.schemas.document import DocumentCreate, DocumentResponse
 from app.schemas.ingestion import IngestionJobResponse
 from app.schemas.audit import AuditLogResponse
-from app.schemas.activity import ActivityLogResponse
+from app.schemas.activity import ActivityLogCreate, ActivityLogResponse
 from app.schemas.search import SearchQueryCreate, SearchQueryResponse, SearchRequest
 
 __all__ = [
@@ -21,6 +21,7 @@ __all__ = [
     "DocumentResponse",
     "IngestionJobResponse",
     "AuditLogResponse",
+    "ActivityLogCreate",
     "ActivityLogResponse",
     "SearchQueryCreate",
     "SearchQueryResponse",

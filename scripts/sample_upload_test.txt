@@ -1,0 +1,36 @@
+RFP Document Upload and Chunking Test
+
+This is a sample document created to test the documents upload API and text chunking service.
+The chunking algorithm splits text into overlapping segments of approximately 800 characters
+with 150 characters of overlap between consecutive chunks. This ensures that semantic context
+is preserved across chunk boundaries for better embedding and vector search results.
+
+
+Project Overview
+
+The RFP (Request for Proposal) system manages document uploads, categorization, and semantic search.
+Documents are automatically assigned to clusters such as Finance, Security, Architecture, Compliance,
+and Integrations. Each document is extracted for text, chunked, embedded using OpenAI, and stored
+in ChromaDB for vector similarity search. The original file is uploaded to S3 for storage and download.
+
+
+Technical Architecture
+
+The backend uses FastAPI with SQLAlchemy for the database layer. Document processing includes
+text extraction from PDF, XLSX, and plain text files. The chunking service uses paragraph-based
+splitting first, with a fallback to fixed-size overlapping windows when no paragraph separators
+exist. ChromaDB stores embeddings per project, enabling project-scoped semantic search.
+
+
+Integration Points
+
+External services include OpenAI for embeddings and categorization, AWS S3 for file storage,
+and MySQL for metadata. The system is designed to be resilient: if OpenAI or S3 fail, the
+document record is still created with appropriate fallback values. Chunking and ChromaDB
+ingestion run when OpenAI is configured.
+
+
+Conclusion
+
+This sample file contains enough content to produce multiple chunks for testing the full
+upload and chunking pipeline. Run the test script to verify end-to-end functionality.

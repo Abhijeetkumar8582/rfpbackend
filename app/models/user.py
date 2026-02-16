@@ -33,6 +33,7 @@ class User(Base):
     refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
     project_memberships = relationship("ProjectMember", back_populates="user", cascade="all, delete-orphan")
     uploaded_documents = relationship("Document", back_populates="uploaded_by_user", foreign_keys="Document.uploaded_by")
+    rfp_questions = relationship("RFPQuestion", back_populates="user", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
         return f"<User id={self.id} email={self.email}>"

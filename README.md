@@ -72,6 +72,14 @@ Upload flow:
 Env: set `OPENAI_API_KEY`, `S3_BUCKET`, and optionally `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` in `.env`.  
 New columns: run `python -m migrations.add_document_cluster_embedding` once to add `cluster` and `embedding_json` to `documents`.
 
+## Frontend integration
+
+The frontend (Next.js) calls the backend at `http://localhost:8000`. Ensure CORS_ORIGINS in `.env` includes `http://localhost:3000`.
+
+1. Start backend: `cd backend && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`
+2. Start frontend: `cd frontend && npm run dev`
+3. Create an account at `/signup`, then sign in. Upload documents in File Repository.
+
 ## Next steps
 
 - Wire auth (get_current_user) to document upload so `uploaded_by` comes from JWT

@@ -38,3 +38,27 @@ def build_s3_key(project_id: int, cluster: str, filename: str) -> str:
     # Normalize cluster for path (no spaces, lowercase for consistency)
     safe_cluster = (cluster or "Uncategorized").strip().replace(" ", "_")
     return f"{project_id}/{safe_cluster}/{filename}"
+
+
+def s3_download(s3_key: str, content_type: str, expires_in: int = 3600) -> str:
+    """
+    Generate presigned GET URL for S3 object.
+    Returns URL string for redirect/download.
+    """
+    if not settings.s3_bucket:
+        raise ValueError("S3 bucket not configured (set S3_BUCKET in .env)")
+
+    import boto3
+
+    client = boto3.client(
+        "s3",
+        region_name=settings.aws_region,
+        aws_access_key_id=settings.aws_access_key_id or None,
+        aws_secret_access_key=settings.aws_secret_access_key or None,
+    )
+    url = client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": settings.s3_bucket, "Key": s3_key, "ResponseContentType": content_type},
+        ExpiresIn=expires_in,
+    )
+    return url

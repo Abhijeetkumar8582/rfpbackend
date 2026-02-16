@@ -22,8 +22,9 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./rfp.db"
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
-    # OpenAI (embeddings + GPT categorization)
+    # OpenAI (embeddings + GPT categorization + doc metadata)
     openai_api_key: str = ""
+    openai_base_url: str = ""  # optional, e.g. for Azure or proxy
     openai_embedding_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"
 
@@ -32,6 +33,13 @@ class Settings(BaseSettings):
     aws_region: str = "us-east-1"
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
+
+    # ChromaDB (vector store — one client, one collection per folder/project)
+    chroma_persist_path: str = "./chroma_data"
+
+    # Chunking (word-based: 100, 200 words per chunk)
+    chunk_size_words: int = 200
+    chunk_overlap_words: int = 30
 
     @property
     def cors_origins_list(self) -> list[str]:

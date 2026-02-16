@@ -33,10 +33,17 @@ class Document(Base):
     # Auto-categorization (cluster) and vector embedding for file repo / search
     cluster: Mapped[str | None] = mapped_column(String(128), nullable=True)
     embedding_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # GPT-generated metadata (title, description, doc_type, tags, taxonomy_suggestions)
+    doc_title: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    doc_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    doc_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tags_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON array of strings
+    taxonomy_suggestions_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON object
 
     project = relationship("Project", back_populates="documents")
     uploaded_by_user = relationship("User", back_populates="uploaded_documents", foreign_keys=[uploaded_by])
     ingestion_jobs = relationship("IngestionJob", back_populates="document", cascade="all, delete-orphan")
+    chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
         return f"<Document id={self.id} filename={self.filename}>"
