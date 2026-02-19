@@ -1,6 +1,7 @@
 """Documents API — upload (chunk → embed → categorize → ChromaDB → S3), list, get, download, delete."""
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
@@ -123,13 +124,17 @@ async def upload_document(
     db: DbSession,
     background_tasks: BackgroundTasks,
     project_id: int = Form(...),
-    uploaded_by: int = Form(...),
+    uploaded_by: str = Form(..., description="User ID (UUID) who is uploading"),
     file: UploadFile = File(...),
 ):
     """
     Upload: extract text → chunk → embed → categorize → ChromaDB → S3.
     Resilient: document is created even if OpenAI, S3, or ChromaDB fail.
     """
+    try:
+        uploaded_by_uuid = uuid.UUID(uploaded_by)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid uploaded_by: must be a valid UUID")
     logger.info("Document upload request received: filename=%s project_id=%s", file.filename, project_id)
     filename = file.filename or "document"
     content_type = file.content_type or "application/octet-stream"
@@ -139,7 +144,7 @@ async def upload_document(
     project = db.execute(select(Project).where(Project.id == project_id)).scalars().one_or_none()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    user = db.execute(select(User).where(User.id == uploaded_by)).scalars().one_or_none()
+    user = db.execute(select(User).where(User.id == uploaded_by_uuid)).scalars().one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found (invalid uploaded_by)")
 
@@ -150,7 +155,7 @@ async def upload_document(
         size_bytes=size_bytes,
         storage_path="pending",
         status=DocumentStatus.ingesting,
-        uploaded_by=uploaded_by,
+        uploaded_by=uploaded_by_uuid,
         uploaded_at=datetime.now(timezone.utc),
     )
     db.add(doc)

@@ -1,10 +1,12 @@
 """Auth API — login, signup, refresh, logout."""
+import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
 
 from app.api.deps import DbSession
+from app.services.activity_log import log_activity
 from app.core.security import (
     hash_password,
     verify_password,
@@ -44,7 +46,7 @@ def register(body: UserCreate, db: DbSession):
 
 
 @router.post("/login", response_model=TokenResponse)
-def login(body: UserLogin, db: DbSession):
+def login(request: Request, body: UserLogin, db: DbSession):
     """Login: validate credentials, return access + refresh tokens and user."""
     user = db.execute(select(User).where(User.email == body.email)).scalars().one_or_none()
     if not user:
@@ -85,6 +87,21 @@ def login(body: UserLogin, db: DbSession):
     db.add(refresh_row)
     db.commit()
 
+    # Record login in activity log (server-side so it appears even if frontend fails)
+    try:
+        client_host = request.client.host if request and request.client else None
+        log_activity(
+            db,
+            actor=user.name or user.email or "User",
+            event_action="Login",
+            target_resource="Platform",
+            severity="info",
+            ip_address=client_host,
+            system="web",
+        )
+    except Exception:
+        pass  # non-blocking; don't fail login if activity_logs table missing or write fails
+
     return TokenResponse(
         access_token=access_token,
         refresh_token=raw_refresh,
@@ -100,8 +117,12 @@ def refresh_token(body: RefreshBody, db: DbSession):
     if not payload or payload.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
-    user_id = payload.get("sub")
-    if not user_id:
+    user_id_raw = payload.get("sub")
+    if not user_id_raw:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    try:
+        user_id = uuid.UUID(user_id_raw)
+    except (TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     token_hash = hash_refresh_token(body.refresh_token)
@@ -109,7 +130,7 @@ def refresh_token(body: RefreshBody, db: DbSession):
     refresh_row = db.execute(
         select(RefreshToken).where(
             and_(
-                RefreshToken.user_id == int(user_id),
+                RefreshToken.user_id == user_id,
                 RefreshToken.token_hash == token_hash,
                 RefreshToken.revoked_at.is_(None),
                 RefreshToken.expires_at > datetime.now(timezone.utc),
@@ -119,7 +140,7 @@ def refresh_token(body: RefreshBody, db: DbSession):
     if not refresh_row:
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
-    user = db.get(User, int(user_id))
+    user = db.get(User, user_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
 
@@ -139,20 +160,25 @@ def logout(body: RefreshBody, db: DbSession):
     if not payload or payload.get("type") != "refresh":
         return Message(message="OK")
 
-    user_id = payload.get("sub")
+    user_id_raw = payload.get("sub")
     token_hash = hash_refresh_token(body.refresh_token)
-    if user_id:
-        from sqlalchemy import and_
-        refresh_row = db.execute(
-            select(RefreshToken).where(
-                and_(
-                    RefreshToken.user_id == int(user_id),
-                    RefreshToken.token_hash == token_hash,
-                    RefreshToken.revoked_at.is_(None),
+    if user_id_raw:
+        try:
+            user_id = uuid.UUID(user_id_raw)
+        except (TypeError, ValueError):
+            user_id = None
+        if user_id:
+            from sqlalchemy import and_
+            refresh_row = db.execute(
+                select(RefreshToken).where(
+                    and_(
+                        RefreshToken.user_id == user_id,
+                        RefreshToken.token_hash == token_hash,
+                        RefreshToken.revoked_at.is_(None),
+                    )
                 )
-            )
-        ).scalars().one_or_none()
-        if refresh_row:
-            refresh_row.revoked_at = datetime.now(timezone.utc)
-            db.commit()
+            ).scalars().one_or_none()
+            if refresh_row:
+                refresh_row.revoked_at = datetime.now(timezone.utc)
+                db.commit()
     return Message(message="OK")

@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
@@ -21,7 +22,7 @@ async def list_rfp_questions(
     db: DbSession,
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(20, ge=1, le=100, description="Max records per page"),
-    user_id: int | None = Query(None, description="Filter by user ID (optional)"),
+    user_id: uuid.UUID | None = Query(None, description="Filter by user ID (optional)"),
     status: str | None = Query(None, description="Filter by status (e.g. Draft, Sent)"),
 ):
     """
@@ -114,17 +115,21 @@ def _extract_questions(file: UploadFile, body: bytes) -> list[str]:
 @router.post("/import", response_model=dict)
 async def import_questions(
     db: DbSession,
-    user_id: int = Form(..., description="User ID who is importing"),
+    user_id: str = Form(..., description="User ID (UUID) who is importing"),
     file: UploadFile = File(..., description="Excel or CSV file with questions in column A"),
 ):
     """
     Import questions from Excel or CSV.
     Extracts column A as list of questions, generates rfpid, and stores in rfpquestions table.
     """
+    try:
+        user_id_uuid = uuid.UUID(user_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid user_id: must be a valid UUID")
     logger.info("RFP questions import: filename=%s user_id=%s", file.filename, user_id)
 
     # Validate user exists
-    user = db.execute(select(User).where(User.id == user_id)).scalars().one_or_none()
+    user = db.execute(select(User).where(User.id == user_id_uuid)).scalars().one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -147,7 +152,7 @@ async def import_questions(
 
     record = RFPQuestion(
         rfpid=rfpid,
-        user_id=user_id,
+        user_id=user_id_uuid,
         name=name[:512],
         created_at=now,
         last_activity_at=now,

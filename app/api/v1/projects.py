@@ -1,14 +1,18 @@
 """Projects API — CRUD and members."""
+import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 from sqlalchemy import select
 
 from app.api.deps import DbSession
 from app.models.project import Project
+from app.models.document import Document
+from app.models.document_chunk import DocumentChunk
 
-from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
+from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse, TrainDatasourceConfig, TrainDatasourceResponse
 from app.schemas.common import IDResponse, Message
+from app.services.chroma import sync_project_chunks_to_chroma
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -55,6 +59,38 @@ def delete_project(project_id: int, db: DbSession):
     raise NotImplementedError("TODO: implement delete project")
 
 
+@router.post("/{project_id}/train-datasource", response_model=TrainDatasourceResponse)
+def train_datasource(project_id: int, db: DbSession, body: TrainDatasourceConfig | None = Body(None)):
+    """
+    Fetch all document chunks and their stored embeddings from the DB and push to ChromaDB.
+    Upload already stores chunks + embeddings in document_chunks; train re-syncs that data
+    into the project's Chroma collection (clear then add all). No re-embedding — uses DB embeddings.
+    """
+    project = db.execute(select(Project).where(Project.id == project_id, Project.is_deleted == False)).scalars().one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Fetch all documents in this project that have chunk rows (content + embeddings_json from upload)
+    docs = db.execute(
+        select(Document, DocumentChunk)
+        .join(DocumentChunk, Document.id == DocumentChunk.document_id)
+        .where(Document.project_id == project_id, Document.deleted_at.is_(None))
+    ).all()
+
+    # Build rows: (document_id, filename, content_json, embeddings_json) — all from DB
+    rows = [
+        (doc.id, doc.filename, chunk_row.content, chunk_row.embeddings_json)
+        for doc, chunk_row in docs
+    ]
+
+    documents_synced, chunks_synced = sync_project_chunks_to_chroma(project_id, rows)
+    return TrainDatasourceResponse(
+        message="Datasource trained: all document chunks synced to ChromaDB.",
+        documents_synced=documents_synced,
+        chunks_synced=chunks_synced,
+    )
+
+
 @router.get("/{project_id}/members")
 def list_project_members(project_id: int, db: DbSession):
     """List project members. TODO: check membership, return user info."""
@@ -62,12 +98,12 @@ def list_project_members(project_id: int, db: DbSession):
 
 
 @router.post("/{project_id}/members/{user_id}", response_model=Message)
-def add_project_member(project_id: int, user_id: int, db: DbSession):
+def add_project_member(project_id: int, user_id: uuid.UUID, db: DbSession):
     """Add user to project. TODO: check permission."""
     raise NotImplementedError("TODO: implement add project member")
 
 
 @router.delete("/{project_id}/members/{user_id}", response_model=Message)
-def remove_project_member(project_id: int, user_id: int, db: DbSession):
+def remove_project_member(project_id: int, user_id: uuid.UUID, db: DbSession):
     """Remove user from project. TODO: check permission."""
     raise NotImplementedError("TODO: implement remove project member")

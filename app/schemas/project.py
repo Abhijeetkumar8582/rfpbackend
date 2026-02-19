@@ -28,3 +28,18 @@ class ProjectResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class TrainDatasourceConfig(BaseModel):
+    """Optional config for training (chunk/embedding settings). Stored for future re-chunking; sync uses existing DB chunks."""
+
+    chunk_size_words: int | None = None
+    chunk_overlap_words: int | None = None
+    embedding_model: str | None = None
+    include_metadata: bool | None = None
+
+
+class TrainDatasourceResponse(BaseModel):
+    message: str
+    documents_synced: int
+    chunks_synced: int

@@ -1,6 +1,7 @@
 """Password hashing and JWT token utilities."""
 import hashlib
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import jwt
@@ -26,8 +27,8 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def create_access_token(sub: int | str) -> str:
-    """Create a JWT access token with subject (user id) and expiry."""
+def create_access_token(sub: int | str | uuid.UUID) -> str:
+    """Create a JWT access token with subject (user id, e.g. UUID) and expiry."""
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_expire_minutes)
     payload = {"sub": str(sub), "exp": expire, "type": "access"}
     return jwt.encode(
@@ -37,7 +38,7 @@ def create_access_token(sub: int | str) -> str:
     )
 
 
-def create_refresh_token_pair(sub: int | str) -> tuple[str, str]:
+def create_refresh_token_pair(sub: int | str | uuid.UUID) -> tuple[str, str]:
     """
     Create a refresh token string and its hash for DB storage.
     Returns (raw_token, token_hash).
