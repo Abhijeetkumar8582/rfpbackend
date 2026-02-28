@@ -7,7 +7,7 @@ import re
 import random
 from typing import Any
 
-from app.config import settings
+from app.services.openai_client import get_chat_client
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ def sample_chunks(
 def build_context(
     filename: str, chunks: list[dict[str, Any]], max_chars: int = 12000
 ) -> str:
-    lines = [f"FILENAME: {filename}"]
+    lines = [f"FILENAME: {str(filename) if filename is not None else 'document'}"]
     for c in chunks:
         idx = c.get("chunk_index")
         page = c.get("page", 1)
@@ -70,23 +70,11 @@ def build_context(
     return ctx[:max_chars]
 
 
-def _get_client():
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY is required for GPT-generated metadata.")
-    from openai import OpenAI
-
-    if settings.openai_base_url:
-        return OpenAI(
-            api_key=settings.openai_api_key, base_url=settings.openai_base_url
-        ), settings.openai_chat_model
-    return OpenAI(api_key=settings.openai_api_key), settings.openai_chat_model
-
-
 def gpt_doc_metadata(
-    document_id: int, filename: str, context: str
+    document_id: str, filename: str, context: str
 ) -> dict[str, Any]:
     """GPT generates title, description, doc_type, tags[15], taxonomy_suggestions."""
-    client, model = _get_client()
+    client, model = get_chat_client()
 
     schema_hint = {
         "document_id": document_id,
@@ -131,7 +119,8 @@ def gpt_doc_metadata(
     data = json.loads(raw)
 
     data["document_id"] = document_id
-    data["title"] = str(data.get("title", filename.replace("_", " ")))[:120].strip()
+    filename_str = str(filename) if filename is not None else "document"
+    data["title"] = str(data.get("title", filename_str.replace("_", " ")))[:120].strip()
     data["description"] = str(data.get("description", ""))[:350].strip()
     data["doc_type"] = str(data.get("doc_type", "other")).strip()
     # Accept tags from "tags" or "tag_list"; no placeholder fill — only real tags
@@ -168,7 +157,7 @@ def chunks_list_to_dict_format(chunks: list[str]) -> list[dict[str, Any]]:
 
 
 def generate_doc_metadata(
-    document_id: int,
+    document_id: str,
     filename: str,
     chunks: list[str],
     max_chunks_for_gpt: int = 12,

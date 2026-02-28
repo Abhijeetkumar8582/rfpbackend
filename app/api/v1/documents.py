@@ -1,7 +1,6 @@
 """Documents API — upload (chunk → embed → categorize → ChromaDB → S3), list, get, download, delete."""
 import json
 import logging
-import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
@@ -10,6 +9,7 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DbSession
+from app.core.document_id import generate_document_id
 from app.config import settings
 from app.database import SessionLocal
 from app.models.document import Document, DocumentStatus
@@ -18,6 +18,7 @@ from app.models.project import Project
 from app.models.user import User
 from app.schemas.document import (
     DocumentResponse,
+    DocumentUpdate,
     DocumentChunksResponse,
     DocumentChunkItem,
     DocumentMetadataResponse,
@@ -50,7 +51,7 @@ def _embed_and_categorize(text: str, filename: str) -> tuple[str | None, str]:
     return embedding_json, cluster
 
 
-def _upload_to_s3(body: bytes, project_id: int, cluster: str, filename: str, content_type: str) -> str | None:
+def _upload_to_s3(body: bytes, project_id: str, cluster: str, filename: str, content_type: str) -> str | None:
     """Upload to S3. Returns s3_key or None if S3 unavailable."""
     if not settings.s3_bucket:
         logger.warning("S3 upload skipped: S3_BUCKET not set in .env")
@@ -66,7 +67,7 @@ def _upload_to_s3(body: bytes, project_id: int, cluster: str, filename: str, con
 
 
 @router.get("", response_model=list[DocumentResponse])
-def list_documents(db: DbSession, project_id: int | None = None, skip: int = 0, limit: int = 100):
+def list_documents(db: DbSession, project_id: str | None = None, skip: int = 0, limit: int = 100):
     """List documents, optionally by project. TODO: add auth, filter by access."""
     q = select(Document).where(Document.deleted_at.is_(None))
     if project_id is not None:
@@ -75,7 +76,7 @@ def list_documents(db: DbSession, project_id: int | None = None, skip: int = 0, 
     return list(db.execute(q).scalars().all())
 
 
-def _run_generate_metadata_background(document_id: int) -> None:
+def _run_generate_metadata_background(document_id: str) -> None:
     """Background task: load doc + chunks, generate metadata via GPT, update document and document_chunks."""
     db = SessionLocal()
     try:
@@ -123,7 +124,7 @@ def _run_generate_metadata_background(document_id: int) -> None:
 async def upload_document(
     db: DbSession,
     background_tasks: BackgroundTasks,
-    project_id: int = Form(...),
+    project_id: str = Form(...),
     uploaded_by: str = Form(..., description="User ID (UUID) who is uploading"),
     file: UploadFile = File(...),
 ):
@@ -131,10 +132,6 @@ async def upload_document(
     Upload: extract text → chunk → embed → categorize → ChromaDB → S3.
     Resilient: document is created even if OpenAI, S3, or ChromaDB fail.
     """
-    try:
-        uploaded_by_uuid = uuid.UUID(uploaded_by)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid uploaded_by: must be a valid UUID")
     logger.info("Document upload request received: filename=%s project_id=%s", file.filename, project_id)
     filename = file.filename or "document"
     content_type = file.content_type or "application/octet-stream"
@@ -144,18 +141,19 @@ async def upload_document(
     project = db.execute(select(Project).where(Project.id == project_id)).scalars().one_or_none()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    user = db.execute(select(User).where(User.id == uploaded_by_uuid)).scalars().one_or_none()
+    user = db.execute(select(User).where(User.id == uploaded_by)).scalars().one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found (invalid uploaded_by)")
 
     doc = Document(
+        id=generate_document_id(db),
         project_id=project_id,
         filename=filename,
         content_type=content_type,
         size_bytes=size_bytes,
         storage_path="pending",
         status=DocumentStatus.ingesting,
-        uploaded_by=uploaded_by_uuid,
+        uploaded_by=uploaded_by,
         uploaded_at=datetime.now(timezone.utc),
     )
     db.add(doc)
@@ -239,7 +237,7 @@ async def upload_document(
 
 
 @router.get("/{document_id}/chunks", response_model=DocumentChunksResponse)
-def get_document_chunks(document_id: int, db: DbSession):
+def get_document_chunks(document_id: str, db: DbSession):
     """Get vector chunks for a document from document_chunks table. Supports both schemas: one row with JSON array or multiple rows with chunk_index+content."""
     doc = db.execute(select(Document).where(Document.id == document_id)).scalars().one_or_none()
     if not doc:
@@ -296,7 +294,7 @@ def get_document_chunks(document_id: int, db: DbSession):
 
 
 @router.post("/{document_id}/generate-metadata", response_model=DocumentMetadataResponse)
-def generate_document_metadata(document_id: int, db: DbSession):
+def generate_document_metadata(document_id: str, db: DbSession):
     """Generate GPT metadata from document chunks (title, description, doc_type, tags, taxonomy). Runs once chunks exist."""
     doc = db.execute(select(Document).where(Document.id == document_id)).scalars().one_or_none()
     if not doc:
@@ -347,7 +345,7 @@ def generate_document_metadata(document_id: int, db: DbSession):
 
 
 @router.get("/{document_id}", response_model=DocumentResponse)
-def get_document(document_id: int, db: DbSession):
+def get_document(document_id: str, db: DbSession):
     """Get document metadata. TODO: check project access."""
     doc = db.execute(select(Document).where(Document.id == document_id)).scalars().one_or_none()
     if not doc:
@@ -355,8 +353,49 @@ def get_document(document_id: int, db: DbSession):
     return doc
 
 
+@router.patch("/{document_id}", response_model=DocumentResponse)
+def update_document(document_id: str, body: DocumentUpdate, db: DbSession):
+    """Update document metadata (title, description, doc_type, tags, taxonomy). Soft-deleted docs return 404."""
+    doc = db.execute(select(Document).where(Document.id == document_id)).scalars().one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.deleted_at:
+        raise HTTPException(status_code=404, detail="Document deleted")
+
+    if body.doc_title is not None:
+        doc.doc_title = body.doc_title
+    if body.doc_description is not None:
+        doc.doc_description = body.doc_description
+    if body.doc_type is not None:
+        doc.doc_type = body.doc_type
+    if body.tags is not None:
+        doc.tags_json = json.dumps(body.tags)
+    if body.taxonomy_suggestions is not None:
+        doc.taxonomy_suggestions_json = json.dumps(body.taxonomy_suggestions)
+
+    # Keep document_chunks in sync (one row per document)
+    chunk_row = db.execute(
+        select(DocumentChunk).where(DocumentChunk.document_id == document_id)
+    ).scalars().one_or_none()
+    if chunk_row:
+        if body.doc_title is not None:
+            chunk_row.doc_title = body.doc_title
+        if body.doc_description is not None:
+            chunk_row.doc_description = body.doc_description
+        if body.doc_type is not None:
+            chunk_row.doc_type = body.doc_type
+        if body.tags is not None:
+            chunk_row.tags_json = doc.tags_json
+        if body.taxonomy_suggestions is not None:
+            chunk_row.taxonomy_suggestions_json = doc.taxonomy_suggestions_json
+
+    db.commit()
+    db.refresh(doc)
+    return doc
+
+
 @router.get("/{document_id}/download")
-def download_document(document_id: int, db: DbSession):
+def download_document(document_id: str, db: DbSession):
     """Download file from S3 or return 404 if stored locally."""
     doc = db.execute(select(Document).where(Document.id == document_id)).scalars().one_or_none()
     if not doc:
@@ -377,7 +416,7 @@ def download_document(document_id: int, db: DbSession):
 
 
 @router.delete("/{document_id}", response_model=Message)
-def delete_document(document_id: int, db: DbSession):
+def delete_document(document_id: str, db: DbSession):
     """Soft-delete document and remove chunks from ChromaDB."""
     doc = db.execute(select(Document).where(Document.id == document_id)).scalars().one_or_none()
     if not doc:

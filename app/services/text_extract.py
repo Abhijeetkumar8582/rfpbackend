@@ -17,7 +17,8 @@ def extract_text_from_file(content: bytes | BinaryIO, filename: str, content_typ
     data = data if isinstance(data, bytes) else getattr(content, "read", lambda: b"")()
     stream = io.BytesIO(data)
 
-    ext = (filename or "").rsplit(".", 1)[-1].lower()
+    filename_str = str(filename).strip() if filename is not None else ""
+    ext = (filename_str or "").rsplit(".", 1)[-1].lower()
     if "pdf" in content_type or ext == "pdf":
         return _extract_pdf(stream)
     if "spreadsheet" in content_type or "excel" in content_type or ext in ("xlsx", "xls"):
@@ -29,7 +30,7 @@ def extract_text_from_file(content: bytes | BinaryIO, filename: str, content_typ
         except Exception:
             pass
     # Fallback: use filename as hint for categorization
-    return _filename_to_text(filename)
+    return _filename_to_text(filename_str if filename_str else filename)
 
 
 def _extract_pdf(stream: io.BytesIO) -> str:
@@ -64,7 +65,10 @@ def _extract_xlsx(stream: io.BytesIO) -> str:
 
 def _filename_to_text(filename: str) -> str:
     """Use filename as minimal context for categorization (e.g. sso_security_policy.pdf -> Security)."""
-    if not filename:
+    if filename is None:
         return "Document"
-    base = filename.rsplit(".", 1)[0].replace("_", " ").replace("-", " ")
+    s = str(filename).strip()
+    if not s:
+        return "Document"
+    base = s.rsplit(".", 1)[0].replace("_", " ").replace("-", " ")
     return base or "Document"

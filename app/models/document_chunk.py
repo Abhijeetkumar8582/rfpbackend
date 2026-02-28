@@ -3,6 +3,7 @@ from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.document import DOCUMENT_ID_LENGTH
 
 
 class DocumentChunk(Base):
@@ -15,8 +16,8 @@ class DocumentChunk(Base):
     __table_args__ = (UniqueConstraint("document_id", name="uq_document_chunks_document_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    document_id: Mapped[int] = mapped_column(
-        Integer,
+    document_id: Mapped[str] = mapped_column(
+        String(DOCUMENT_ID_LENGTH),
         ForeignKey("documents.id", ondelete="CASCADE"),
         nullable=False,
         unique=True,

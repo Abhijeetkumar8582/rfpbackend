@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from openpyxl import load_workbook
+from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from app.api.deps import DbSession
@@ -22,7 +23,7 @@ async def list_rfp_questions(
     db: DbSession,
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(20, ge=1, le=100, description="Max records per page"),
-    user_id: uuid.UUID | None = Query(None, description="Filter by user ID (optional)"),
+    user_id: str | None = Query(None, description="Filter by user ID (optional)"),
     status: str | None = Query(None, description="Filter by status (e.g. Draft, Sent)"),
 ):
     """
@@ -52,6 +53,72 @@ async def list_rfp_questions(
             "status": r.status,
         })
     return {"items": items, "total": total}
+
+
+@router.get("/{rfpid}", response_model=dict)
+async def get_rfp(rfpid: str, db: DbSession):
+    """Get a single RFP by rfpid (full details including questions and answers)."""
+    row = db.execute(select(RFPQuestion).where(RFPQuestion.rfpid == rfpid)).scalars().one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="RFP not found")
+    questions = json.loads(row.questions) if row.questions else []
+    answers = json.loads(row.answers) if row.answers else []
+    recipients = json.loads(row.recipients) if row.recipients else []
+    return {
+        "id": row.id,
+        "rfpid": row.rfpid,
+        "name": row.name,
+        "user_id": row.user_id,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "last_activity_at": row.last_activity_at.isoformat() if row.last_activity_at else None,
+        "recipients": recipients,
+        "status": row.status,
+        "questions": questions,
+        "answers": answers,
+    }
+
+
+@router.delete("/{rfpid}", response_model=dict)
+async def delete_rfp(rfpid: str, db: DbSession):
+    """Delete an RFP by rfpid. Permanently removes the record."""
+    row = db.execute(select(RFPQuestion).where(RFPQuestion.rfpid == rfpid)).scalars().one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="RFP not found")
+    db.delete(row)
+    db.commit()
+    return {"message": "RFP deleted", "rfpid": rfpid}
+
+
+class UpdateAnswersBody(BaseModel):
+    """Request body for updating answers array (one answer per question, same order)."""
+    answers: list[str]
+
+
+@router.patch("/{rfpid}/answers", response_model=dict)
+async def update_rfp_answers(
+    rfpid: str,
+    body: UpdateAnswersBody,
+    db: DbSession,
+):
+    """
+    Update the answers array for an RFP (by rfpid).
+    answers must be a list of strings, in the same order as questions.
+    """
+    row = db.execute(select(RFPQuestion).where(RFPQuestion.rfpid == rfpid)).scalars().one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="RFP not found")
+    answers_json = json.dumps(body.answers)
+    row.answers = answers_json
+    row.last_activity_at = datetime.now(timezone.utc)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {
+        "rfpid": row.rfpid,
+        "id": row.id,
+        "answers": body.answers,
+        "last_activity_at": row.last_activity_at.isoformat() if row.last_activity_at else None,
+    }
 
 
 ALLOWED_EXTENSIONS = {".xlsx", ".xls", ".csv"}
@@ -122,14 +189,10 @@ async def import_questions(
     Import questions from Excel or CSV.
     Extracts column A as list of questions, generates rfpid, and stores in rfpquestions table.
     """
-    try:
-        user_id_uuid = uuid.UUID(user_id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid user_id: must be a valid UUID")
     logger.info("RFP questions import: filename=%s user_id=%s", file.filename, user_id)
 
     # Validate user exists
-    user = db.execute(select(User).where(User.id == user_id_uuid)).scalars().one_or_none()
+    user = db.execute(select(User).where(User.id == user_id)).scalars().one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -152,7 +215,7 @@ async def import_questions(
 
     record = RFPQuestion(
         rfpid=rfpid,
-        user_id=user_id_uuid,
+        user_id=user_id,
         name=name[:512],
         created_at=now,
         last_activity_at=now,

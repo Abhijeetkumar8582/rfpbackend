@@ -1,12 +1,14 @@
 """User model — auth and profile."""
 import enum
-import uuid
 from datetime import datetime
 from sqlalchemy import Boolean, DateTime, Enum, Integer, String
-from sqlalchemy.types import Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+
+# User ID format: 10-char UUID prefix + '-' + DDMMYYYYHHMMSS (e.g. U8189cf674-19022026155529)
+USER_ID_LENGTH = 40
 
 
 class UserRole(str, enum.Enum):
@@ -19,7 +21,7 @@ class UserRole(str, enum.Enum):
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[str] = mapped_column(String(USER_ID_LENGTH), primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)

@@ -1,5 +1,4 @@
 """User and auth schemas."""
-import uuid
 from datetime import datetime
 from pydantic import BaseModel, EmailStr
 
@@ -19,7 +18,7 @@ class UserLogin(BaseModel):
 
 
 class UserResponse(BaseModel):
-    id: uuid.UUID
+    id: str
     email: str
     name: str
     role: UserRole

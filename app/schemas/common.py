@@ -7,4 +7,4 @@ class Message(BaseModel):
 
 
 class IDResponse(BaseModel):
-    id: int
+    id: int | str  # project id is str (PROJ-YYYY-NNN), document id is int

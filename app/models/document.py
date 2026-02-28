@@ -1,12 +1,15 @@
 """Document model — project files and ingestion status."""
 import enum
-import uuid
 from datetime import datetime
 from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text
-from sqlalchemy.types import Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.project import PROJECT_ID_LENGTH
+from app.models.user import USER_ID_LENGTH
+
+# Document ID format: Doc-YYYY-NNNN (e.g. Doc-2026-0001)
+DOCUMENT_ID_LENGTH = 20
 
 
 class DocumentStatus(str, enum.Enum):
@@ -20,15 +23,15 @@ class DocumentStatus(str, enum.Enum):
 class Document(Base):
     __tablename__ = "documents"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    id: Mapped[str] = mapped_column(String(DOCUMENT_ID_LENGTH), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(PROJECT_ID_LENGTH), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     content_type: Mapped[str] = mapped_column(String(128), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     storage_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     status: Mapped[DocumentStatus] = mapped_column(Enum(DocumentStatus), nullable=False, default=DocumentStatus.pending)
-    uploaded_by: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    uploaded_by: Mapped[str] = mapped_column(String(USER_ID_LENGTH), ForeignKey("users.id"), nullable=False)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ingested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

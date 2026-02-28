@@ -1,17 +1,19 @@
 """Project and project_members models."""
-import uuid
 from datetime import datetime
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.types import Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.user import USER_ID_LENGTH
+
+# Project ID format: PROJ-YYYY-NNN (e.g. PROJ-2026-001)
+PROJECT_ID_LENGTH = 20
 
 
 class Project(Base):
     __tablename__ = "projects"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(PROJECT_ID_LENGTH), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     retention_days: Mapped[int] = mapped_column(Integer, nullable=False, default=365)
@@ -32,8 +34,8 @@ class ProjectMember(Base):
     __table_args__ = (UniqueConstraint("project_id", "user_id", name="uq_project_member"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
-    user_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    project_id: Mapped[str] = mapped_column(String(PROJECT_ID_LENGTH), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(USER_ID_LENGTH), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     project = relationship("Project", back_populates="members")

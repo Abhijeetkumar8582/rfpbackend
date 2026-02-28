@@ -33,11 +33,13 @@ def s3_upload(
     return s3_key
 
 
-def build_s3_key(project_id: int, cluster: str, filename: str) -> str:
+def build_s3_key(project_id: str, cluster: str, filename: str) -> str:
     """Build S3 key so file repo shows file in correct folder: project_id/cluster/filename."""
-    # Normalize cluster for path (no spaces, lowercase for consistency)
-    safe_cluster = (cluster or "Uncategorized").strip().replace(" ", "_")
-    return f"{project_id}/{safe_cluster}/{filename}"
+    # Normalize cluster and filename (coerce to str in case of int from form/DB)
+    cluster_str = str(cluster).strip() if cluster is not None else "Uncategorized"
+    safe_cluster = cluster_str.replace(" ", "_")
+    filename_str = str(filename) if filename is not None else "document"
+    return f"{project_id}/{safe_cluster}/{filename_str}"
 
 
 def s3_download(s3_key: str, content_type: str, expires_in: int = 3600) -> str:

@@ -9,7 +9,7 @@ router = APIRouter(prefix="/ingestion", tags=["ingestion"])
 
 
 @router.get("/jobs", response_model=list[IngestionJobResponse])
-def list_ingestion_jobs(db: DbSession, project_id: int | None = None, document_id: int | None = None, skip: int = 0, limit: int = 100):
+def list_ingestion_jobs(db: DbSession, project_id: str | None = None, document_id: str | None = None, skip: int = 0, limit: int = 100):
     """List ingestion jobs. TODO: filter by project/document, add auth."""
     raise NotImplementedError("TODO: implement list ingestion jobs")
 
@@ -21,7 +21,7 @@ def get_ingestion_job(job_id: int, db: DbSession):
 
 
 @router.post("/jobs", response_model=IDResponse)
-def create_ingestion_job(db: DbSession, project_id: int, document_id: int | None = None):
+def create_ingestion_job(db: DbSession, project_id: str, document_id: str | None = None):
     """Create and optionally start ingestion job. TODO: implement worker trigger."""
     raise NotImplementedError("TODO: implement create ingestion job")
 

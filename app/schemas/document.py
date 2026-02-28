@@ -6,20 +6,29 @@ from app.models.document import DocumentStatus
 
 
 class DocumentCreate(BaseModel):
-    project_id: int
+    project_id: str
     filename: str
     content_type: str
     size_bytes: int
 
 
+class DocumentUpdate(BaseModel):
+    """Optional fields for updating document metadata (e.g. after GPT or manual edit)."""
+    doc_title: str | None = None
+    doc_description: str | None = None
+    doc_type: str | None = None
+    tags: list[str] | None = None  # serialized to tags_json
+    taxonomy_suggestions: dict[str, list[str]] | None = None  # serialized to taxonomy_suggestions_json
+
+
 class DocumentResponse(BaseModel):
-    id: int
-    project_id: int
+    id: str
+    project_id: str
     filename: str
     content_type: str
     size_bytes: int
     status: DocumentStatus
-    uploaded_by: int
+    uploaded_by: str
     uploaded_at: datetime
     ingested_at: datetime | None
     deleted_at: datetime | None
@@ -47,7 +56,7 @@ class DocumentChunksResponse(BaseModel):
 
 
 class DocumentMetadataResponse(BaseModel):
-    document_id: int
+    document_id: str
     title: str
     description: str
     doc_type: str

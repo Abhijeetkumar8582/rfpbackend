@@ -1,5 +1,4 @@
 """Audit logs API — list security/governance events (stub)."""
-import uuid
 from fastapi import APIRouter
 from app.api.deps import DbSession
 
@@ -11,8 +10,8 @@ router = APIRouter(prefix="/audit", tags=["audit"])
 @router.get("/logs", response_model=list[AuditLogResponse])
 def list_audit_logs(
     db: DbSession,
-    project_id: int | None = None,
-    actor_user_id: uuid.UUID | None = None,
+    project_id: str | None = None,
+    actor_user_id: str | None = None,
     action: str | None = None,
     skip: int = 0,
     limit: int = 100,

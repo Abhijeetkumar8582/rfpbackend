@@ -7,8 +7,8 @@ from app.models.ingestion_job import IngestionJobStatus
 
 class IngestionJobResponse(BaseModel):
     id: int
-    project_id: int
-    document_id: int | None
+    project_id: str
+    document_id: str | None
     status: IngestionJobStatus
     started_at: datetime | None
     finished_at: datetime | None

@@ -18,7 +18,7 @@ class ProjectUpdate(BaseModel):
 
 
 class ProjectResponse(BaseModel):
-    id: int
+    id: str
     name: str
     description: str | None
     retention_days: int

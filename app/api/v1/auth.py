@@ -1,5 +1,4 @@
 """Auth API — login, signup, refresh, logout."""
-import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Request
@@ -15,6 +14,7 @@ from app.core.security import (
     decode_token,
     hash_refresh_token,
 )
+from app.core.user_id import generate_user_id
 from app.models.user import User
 from app.models.refresh_token import RefreshToken
 from app.models.user import UserRole
@@ -32,6 +32,7 @@ def register(body: UserCreate, db: DbSession):
         raise HTTPException(status_code=400, detail="Email already registered")
 
     user = User(
+        id=generate_user_id(),
         email=body.email,
         name=body.name,
         password_hash=hash_password(body.password),
@@ -120,10 +121,7 @@ def refresh_token(body: RefreshBody, db: DbSession):
     user_id_raw = payload.get("sub")
     if not user_id_raw:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
-    try:
-        user_id = uuid.UUID(user_id_raw)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    user_id = user_id_raw
 
     token_hash = hash_refresh_token(body.refresh_token)
     from sqlalchemy import and_
@@ -163,10 +161,7 @@ def logout(body: RefreshBody, db: DbSession):
     user_id_raw = payload.get("sub")
     token_hash = hash_refresh_token(body.refresh_token)
     if user_id_raw:
-        try:
-            user_id = uuid.UUID(user_id_raw)
-        except (TypeError, ValueError):
-            user_id = None
+        user_id = user_id_raw
         if user_id:
             from sqlalchemy import and_
             refresh_row = db.execute(

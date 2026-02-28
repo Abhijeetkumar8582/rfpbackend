@@ -81,8 +81,8 @@ def delete_collection_for_folder(folder_id: str | int) -> None:
 
 
 def add_document_chunks(
-    project_id: int,
-    document_id: int,
+    project_id: str,
+    document_id: str,
     chunks: list[str],
     filename: str = "",
     embeddings: list[list[float]] | None = None,
@@ -107,7 +107,7 @@ def add_document_chunks(
     return len(chunks)
 
 
-def delete_document_chunks(project_id: int, document_id: int) -> None:
+def delete_document_chunks(project_id: str, document_id: str) -> None:
     """Remove all chunks for a document from ChromaDB."""
     coll = get_collection_for_folder(project_id)
     try:
@@ -135,8 +135,8 @@ def clear_collection_for_folder(folder_id: str | int) -> int:
 
 
 def sync_project_chunks_to_chroma(
-    project_id: int,
-    documents_with_chunks: list[tuple[int, str, str | None, str | None]],
+    project_id: str,
+    documents_with_chunks: list[tuple[str, str, str | None, str | None]],
 ) -> tuple[int, int]:
     """
     Fetch all document embeddings from DB and push to ChromaDB (vector store).
@@ -186,7 +186,7 @@ def _ensure_float_list(e: list | object) -> list[float]:
 
 
 def query_collection(
-    project_id: int,
+    project_id: str,
     query_embedding: list[float],
     n_results: int = 5,
     include: list[str] | None = None,

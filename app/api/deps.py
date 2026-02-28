@@ -1,5 +1,4 @@
 """FastAPI dependencies — DB session, auth placeholder."""
-import uuid
 from typing import Annotated
 
 from fastapi import Depends, Request
@@ -30,11 +29,7 @@ def get_current_user_optional(
     sub = payload.get("sub")
     if not sub:
         return None
-    try:
-        user_id = uuid.UUID(sub)
-    except (TypeError, ValueError):
-        return None
-    user = db.get(User, user_id)
+    user = db.get(User, sub)
     if not user or not getattr(user, "is_active", True):
         return None
     return user
