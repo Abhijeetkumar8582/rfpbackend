@@ -36,9 +36,9 @@ def test_search_answer_empty_chunks():
     """Test answer_from_chunks with no chunks returns fallback message."""
     print("\n[2] search_answer — answer_from_chunks(question, [])\n")
     question = "What is the deadline?"
-    answer, topic = answer_from_chunks(question, [])
+    answer, topics_covered, _ = answer_from_chunks(question, [])
     assert "No relevant passages" in answer or "rephrasing" in answer.lower()
-    assert topic is None
+    assert topics_covered == []
     print(f"  Answer: {answer[:150]}...")
     print("  OK")
     return True
@@ -60,13 +60,16 @@ def test_search_answer_with_chunks():
             "score": 0.75,
         },
     ]
-    answer, topic = answer_from_chunks(question, chunks)
+    answer, topics_covered, confidence = answer_from_chunks(question, chunks)
     assert answer, "Answer should be non-empty"
+    assert isinstance(topics_covered, list), "topics_covered should be a list"
     # Answer should reflect passage content (deadline / March / citation)
     assert (
         "deadline" in answer.lower() or "march" in answer.lower() or "15" in answer or "[1]" in answer
     ), "Answer should use passage content"
     print(f"  Answer: {answer[:300]}...")
+    print(f"  Topics covered: {topics_covered}")
+    print(f"  Confidence: {confidence}")
     print("  OK")
     return True
 

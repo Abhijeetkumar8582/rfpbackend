@@ -21,7 +21,7 @@ def generate_document_id(db: Session) -> str:
 
     rows = db.execute(select(Document.id).where(Document.id.like(f"{prefix}%"))).scalars().all()
     max_seq = 0
-    for (id_val,) in rows:
+    for id_val in rows:
         try:
             num_part = id_val.split("-")[-1]
             max_seq = max(max_seq, int(num_part))

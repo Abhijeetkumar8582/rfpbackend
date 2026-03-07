@@ -22,6 +22,7 @@ from app.schemas.document import (
     DocumentChunksResponse,
     DocumentChunkItem,
     DocumentMetadataResponse,
+    PdfExtractImagesResponse,
 )
 from app.schemas.common import IDResponse, Message
 from app.services.text_extract import extract_text_from_file
@@ -31,6 +32,7 @@ from app.services.categorize import categorize_document
 from app.services.doc_metadata import generate_doc_metadata
 from app.services.s3 import s3_upload, build_s3_key, s3_download
 from app.services.chroma import add_document_chunks, delete_document_chunks
+from app.services.pdf_ocr import is_probably_scanned, extract_images_and_ocr_text
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,30 @@ def list_documents(db: DbSession, project_id: str | None = None, skip: int = 0, 
         q = q.where(Document.project_id == project_id)
     q = q.offset(skip).limit(limit).order_by(Document.uploaded_at.desc())
     return list(db.execute(q).scalars().all())
+
+
+@router.post("/pdf-extract-images", response_model=PdfExtractImagesResponse)
+async def pdf_extract_images(file: UploadFile = File(...)):
+    """
+    Scan the whole PDF, extract all images, and convert to text via OCR.
+    Use when a PDF appears to be scanned or image-heavy (e.g. after is_probably_scanned).
+    """
+    filename = file.filename or ""
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    body = await file.read()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    is_scanned = is_probably_scanned(body)
+    extracted_text, pages_processed = extract_images_and_ocr_text(body)
+
+    return PdfExtractImagesResponse(
+        extracted_text=extracted_text,
+        is_probably_scanned=is_scanned,
+        pages_processed=pages_processed,
+    )
 
 
 def _run_generate_metadata_background(document_id: str) -> None:
@@ -127,6 +153,7 @@ async def upload_document(
     project_id: str = Form(...),
     uploaded_by: str = Form(..., description="User ID (UUID) who is uploading"),
     file: UploadFile = File(...),
+    extract_pdf_images: str = Form("true", description="If true, extract text from images in PDFs (scanned docs)"),
 ):
     """
     Upload: extract text → chunk → embed → categorize → ChromaDB → S3.
@@ -162,6 +189,16 @@ async def upload_document(
 
     try:
         text = extract_text_from_file(body, filename, content_type)
+
+        # For PDFs: if extract_pdf_images enabled and probably scanned (image-heavy), extract text from images via OCR
+        run_pdf_ocr = extract_pdf_images.lower() not in ("false", "0", "no", "off")
+        if run_pdf_ocr and content_type and "pdf" in content_type and (filename or "").lower().endswith(".pdf"):
+            if is_probably_scanned(body):
+                ocr_text, _ = extract_images_and_ocr_text(body)
+                if ocr_text and ocr_text.strip():
+                    text = (text.strip() + "\n\n" + ocr_text).strip() if text and text.strip() else ocr_text
+                    logger.info("Merged OCR text from PDF images for document_id=%s", doc.id)
+
         if not text or not text.strip():
             text = f"Filename: {filename}"
 

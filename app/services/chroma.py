@@ -80,6 +80,15 @@ def delete_collection_for_folder(folder_id: str | int) -> None:
         pass  # no-op if collection does not exist
 
 
+def get_collection_count(folder_id: str | int) -> int:
+    """Return the number of chunks in the ChromaDB collection for this folder (project)."""
+    try:
+        coll = get_collection_for_folder(folder_id)
+        return coll.count()
+    except Exception:
+        return 0
+
+
 def add_document_chunks(
     project_id: str,
     document_id: str,
@@ -205,3 +214,79 @@ def query_collection(
         include=include,
     )
     return result
+
+
+def query_collection_multi(
+    project_id: str,
+    query_embeddings: list[list[float]],
+    n_results_per_query: int = 15,
+    total_results: int = 25,
+    include: list[str] | None = None,
+) -> dict:
+    """
+    Search ChromaDB with multiple query embeddings (e.g. from query rewriting).
+    Merges results using Reciprocal Rank Fusion (RRF) and returns top total_results.
+    """
+    if not query_embeddings:
+        return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+    if include is None:
+        include = ["documents", "metadatas", "distances"]
+
+    coll = get_collection_for_folder(project_id)
+    result = coll.query(
+        query_embeddings=query_embeddings,
+        n_results=n_results_per_query,
+        include=include,
+    )
+
+    ids_list = result.get("ids") or [[]]
+    documents_list = result.get("documents") or [[]]
+    metadatas_list = result.get("metadatas") or [[]]
+    distances_list = result.get("distances") or [[]]
+
+    # RRF: score(d) = sum over rankings of 1/(k + rank(d)), k=60
+    k_rrf = 60
+    rrf_scores: dict[str, float] = {}
+    id_to_data: dict[str, tuple[str, dict, float]] = {}
+
+    for rank_idx, ids in enumerate(ids_list):
+        docs = documents_list[rank_idx] if rank_idx < len(documents_list) else []
+        metas = metadatas_list[rank_idx] if rank_idx < len(metadatas_list) else []
+        dists = distances_list[rank_idx] if rank_idx < len(distances_list) else []
+
+        for r, chunk_id in enumerate(ids):
+            if chunk_id not in rrf_scores:
+                rrf_scores[chunk_id] = 0.0
+                doc = docs[r] if r < len(docs) else ""
+                meta = metas[r] if r < len(metas) else {}
+                dist = float(dists[r]) if r < len(dists) else 0.0
+                id_to_data[chunk_id] = (doc, meta, dist)
+            rrf_scores[chunk_id] += 1.0 / (k_rrf + r)
+
+    # Sort by RRF score descending, take top total_results
+    sorted_ids = sorted(
+        rrf_scores.keys(),
+        key=lambda x: rrf_scores[x],
+        reverse=True,
+    )[:total_results]
+
+    out_ids = []
+    out_docs = []
+    out_metas = []
+    out_dists = []
+
+    for cid in sorted_ids:
+        doc, meta, dist = id_to_data.get(cid, ("", {}, 0.0))
+        out_ids.append(cid)
+        out_docs.append(doc)
+        out_metas.append(meta)
+        out_dists.append(dist)
+
+    # Return shape compatible with single-query: one list each (not list of lists)
+    return {
+        "ids": [out_ids],
+        "documents": [out_docs],
+        "metadatas": [out_metas],
+        "distances": [out_dists],
+    }

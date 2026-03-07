@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     chunk_size_words: int = 200
     chunk_overlap_words: int = 30
 
+    # PDF OCR (optional: path to Tesseract executable if not in PATH, e.g. C:/Program Files/Tesseract-OCR/tesseract.exe)
+    tesseract_cmd: str = ""
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

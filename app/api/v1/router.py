@@ -1,7 +1,7 @@
 """API v1 — aggregate all routers."""
 from fastapi import APIRouter
 
-from app.api.v1 import auth, users, projects, documents, ingestion, search, audit, activity, api_keys, rfp_questions, rephrase
+from app.api.v1 import auth, users, projects, documents, ingestion, search, audit, activity, api_keys, rfp_questions, rephrase, analytics
 
 api_router = APIRouter()
 
@@ -11,6 +11,7 @@ api_router.include_router(projects.router, prefix="")
 api_router.include_router(documents.router, prefix="")
 api_router.include_router(ingestion.router, prefix="")
 api_router.include_router(search.router, prefix="")
+api_router.include_router(analytics.router, prefix="")
 api_router.include_router(audit.router, prefix="")
 api_router.include_router(activity.router, prefix="")
 api_router.include_router(api_keys.router, prefix="")

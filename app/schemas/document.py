@@ -62,3 +62,10 @@ class DocumentMetadataResponse(BaseModel):
     doc_type: str
     tags: list[str]
     taxonomy_suggestions: dict[str, list[str]]
+
+
+class PdfExtractImagesResponse(BaseModel):
+    """Response from PDF image OCR extraction API."""
+    extracted_text: str
+    is_probably_scanned: bool
+    pages_processed: int = 0
