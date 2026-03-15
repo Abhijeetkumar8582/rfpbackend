@@ -10,6 +10,9 @@ from app.models.audit_log import AuditLog
 from app.models.activity_log import ActivityLog
 from app.models.search_query import SearchQuery
 from app.models.rfp_question import RFPQuestion
+from app.models.endpoint_log import EndpointLog
+from app.models.conversation_log import ConversationLog
+from app.models.faq import FAQ
 
 __all__ = [
     "User",
@@ -24,4 +27,7 @@ __all__ = [
     "ActivityLog",
     "SearchQuery",
     "RFPQuestion",
+    "EndpointLog",
+    "ConversationLog",
+    "FAQ",
 ]

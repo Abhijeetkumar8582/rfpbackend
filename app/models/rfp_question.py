@@ -32,6 +32,7 @@ class RFPQuestion(Base):
     status: Mapped[str] = mapped_column(String(64), nullable=False, default="Draft")  # Draft, Sent, Viewed, etc.
     questions: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array of question strings
     answers: Mapped[str] = mapped_column(Text, nullable=False, default="[]")  # JSON array (initially empty)
+    confidence: Mapped[str | None] = mapped_column(Text, nullable=True, default="[]")  # JSON array; MySQL uses JSON type (nullable, no default)
 
     user = relationship("User", back_populates="rfp_questions")
 

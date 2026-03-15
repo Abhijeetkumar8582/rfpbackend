@@ -18,6 +18,9 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# When no articles/chunks are found, answer text starts with this prefix (frontend uses it for unanswered count).
+UNANSWERED_PREFIX = "Unanswered : "
+
 # Max chars for the user message sent to GPT (some gateways 400 on very large payloads)
 _MAX_USER_CONTENT_CHARS = 8000
 
@@ -39,15 +42,19 @@ def answer_from_chunks(question: str, chunks: list[dict]) -> tuple[str, list[str
     Use GPT to synthesize a concise answer from the given question and retrieved chunks.
     chunks: list of {content, filename, score} (or at least content).
     Returns (answer, topics_covered, confidence).
-    confidence: {overall, evidence_coverage, contradiction_risk} from GPT (0-1 floats).
+    confidence: dict with keys overall, evidence_coverage, contradiction_risk (0-1 floats).
+    Use confidence["overall"] as the single per-question value for RFP confidence array storage.
 
     Uses OPENAI_BASE_URL and OPENAI_API_KEY from .env for the chat completions request.
     """
     empty_topics: list[str] = []
     empty_confidence: dict = {"overall": 0.0, "evidence_coverage": 0.0, "contradiction_risk": 0.0}
     if not chunks:
+        gpt_message = (
+            "No relevant passages were found. Try rephrasing your question or adding more documents to this project."
+        )
         return (
-            "No relevant passages were found. Try rephrasing your question or adding more documents to this project.",
+            UNANSWERED_PREFIX + gpt_message,
             empty_topics,
             empty_confidence,
         )

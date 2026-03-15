@@ -18,6 +18,32 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/rfp-questions", tags=["rfp-questions"])
 
+
+NO_CONTEXT_MESSAGE = "Sorry No articles found"
+
+
+def _confidence_as_array(raw: str | list | None) -> list:
+    """Parse confidence from DB; always return a list (only array). Handles MySQL JSON column returning list."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return list(raw)
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+        return list(val) if isinstance(val, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _answers_for_response(answers: list) -> list:
+    """Return answers for API response; empty/missing values become NO_CONTEXT_MESSAGE."""
+    return [
+        (a if (a is not None and str(a).strip()) else NO_CONTEXT_MESSAGE)
+        for a in answers
+    ]
+
 @router.get("", response_model=dict)
 async def list_rfp_questions(
     db: DbSession,
@@ -63,7 +89,10 @@ async def get_rfp(rfpid: str, db: DbSession):
         raise HTTPException(status_code=404, detail="RFP not found")
     questions = json.loads(row.questions) if row.questions else []
     answers = json.loads(row.answers) if row.answers else []
+    confidence = _confidence_as_array(getattr(row, "confidence", None))
     recipients = json.loads(row.recipients) if row.recipients else []
+    # When no context was found, answer is empty; return user-facing message
+    answers_for_response = _answers_for_response(answers)
     return {
         "id": row.id,
         "rfpid": row.rfpid,
@@ -74,7 +103,8 @@ async def get_rfp(rfpid: str, db: DbSession):
         "recipients": recipients,
         "status": row.status,
         "questions": questions,
-        "answers": answers,
+        "answers": answers_for_response,
+        "confidence": confidence,
     }
 
 
@@ -90,8 +120,9 @@ async def delete_rfp(rfpid: str, db: DbSession):
 
 
 class UpdateAnswersBody(BaseModel):
-    """Request body for updating answers array (one answer per question, same order)."""
+    """Request body for updating answers array (one answer per question, same order). Optional confidence array (numbers, same order)."""
     answers: list[str]
+    confidence: list[float] | None = None  # optional: one confidence value per question, same row order
 
 
 @router.patch("/{rfpid}/answers", response_model=dict)
@@ -109,14 +140,21 @@ async def update_rfp_answers(
         raise HTTPException(status_code=404, detail="RFP not found")
     answers_json = json.dumps(body.answers)
     row.answers = answers_json
+    if body.confidence is not None:
+        # Store only array of numbers
+        row.confidence = json.dumps([float(x) for x in list(body.confidence)])
     row.last_activity_at = datetime.now(timezone.utc)
     db.add(row)
     db.commit()
     db.refresh(row)
+    confidence_out = _confidence_as_array(row.confidence)
+    # When no context was found, answer is empty; return user-facing message
+    answers_for_response = _answers_for_response(body.answers)
     return {
         "rfpid": row.rfpid,
         "id": row.id,
-        "answers": body.answers,
+        "answers": answers_for_response,
+        "confidence": confidence_out,
         "last_activity_at": row.last_activity_at.isoformat() if row.last_activity_at else None,
     }
 
@@ -211,6 +249,7 @@ async def import_questions(
         name = "Untitled RFP"
     questions_json = json.dumps(questions)
     answers_json = json.dumps([])
+    confidence_json = json.dumps([])  # one number per question, same order; empty until populated
     recipients_json = json.dumps([])
 
     record = RFPQuestion(
@@ -223,6 +262,7 @@ async def import_questions(
         status="Draft",
         questions=questions_json,
         answers=answers_json,
+        confidence=confidence_json,
     )
     db.add(record)
     db.commit()

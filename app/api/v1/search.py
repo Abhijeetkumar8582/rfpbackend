@@ -37,6 +37,7 @@ from app.schemas.search import (
 from app.services.embeddings import get_embedding
 from app.services.chroma import query_collection, query_collection_multi
 from app.services.search_answer import answer_from_chunks
+from app.services.query_intelligence import run_query_intelligence
 from app.services.reasoning import (
     analyze_and_rewrite_query,
     bundle_evidence,
@@ -45,6 +46,8 @@ from app.services.reasoning import (
     save_reasoning_search,
     self_check,
 )
+from app.utils.conversation_id import generate_conversation_id, is_conversation_valid
+from app.services.activity_log import log_activity
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -183,7 +186,7 @@ def _save_search_query(
     db: DbSession,
     *,
     actor_user_id: str | None,
-    project_id: str,
+    conversation_id: str,
     query_text: str,
     k: int,
     results_count: int,
@@ -199,9 +202,9 @@ def _save_search_query(
 ) -> SearchQuery | None:
     """Persist one search to search_queries table. Returns the created row or None on failure."""
     row = SearchQuery(
-        ts=datetime.now(timezone.utc),
+        datetime_=datetime.now(timezone.utc),
+        conversation_id=conversation_id,
         actor_user_id=actor_user_id,
-        project_id=project_id,
         query_text=query_text,
         k=k,
         filters_json=filters_json,
@@ -219,6 +222,20 @@ def _save_search_query(
     db.commit()
     db.refresh(row)
     return row
+
+
+def _resolve_conversation_id(db: DbSession, conversation_id_from_body: str | None) -> str:
+    """Return a valid conversation_id: reuse body's if still within 24h, else generate new."""
+    if not conversation_id_from_body or len(conversation_id_from_body) < 10:
+        return generate_conversation_id()
+    from sqlalchemy import func
+    result = db.execute(
+        select(func.min(SearchQuery.datetime_)).where(SearchQuery.conversation_id == conversation_id_from_body)
+    )
+    first_ts = result.scalar()
+    if is_conversation_valid(first_ts):
+        return conversation_id_from_body
+    return generate_conversation_id()
 
 
 def _compute_answer_status_and_reason(
@@ -392,25 +409,59 @@ def search(body: SearchRequest, db: DbSession, current_user: CurrentUserOptional
     Embed the question, search ChromaDB for the project's collection,
     return top-k chunks by similarity (question embedding vs stored chunk embeddings).
     Saves the search to search_queries table.
+    When advanced_search=True, runs Query Intelligence Layer first (cleanup, intent, split, rewrite, domain, filters, clarification, plan).
     """
     query_text = (body.query_text or "").strip()
     if not query_text:
         raise HTTPException(status_code=400, detail="query_text is required")
 
     t0 = datetime.now(timezone.utc)
+    advanced_search_used = bool(body.advanced_search)
+    cleaned_query: str | None = None
+    clarification_needed = False
+    clarification_questions: list[str] = []
+    filters_json = body.filters_json
+    queries = [query_text]
+
+    if body.advanced_search:
+        try:
+            iq = run_query_intelligence(query_text)
+            query_text = iq.cleaned_query or query_text
+            cleaned_query = iq.cleaned_query or None
+            clarification_needed = iq.clarification_status == "clarification_needed"
+            clarification_questions = list(iq.suggested_clarification_questions or [])
+            queries = iq.queries_for_retrieval[:6] if iq.queries_for_retrieval else [query_text]
+            if iq.filters:
+                filters_json = filters_json or {}
+                f = iq.filters.model_dump(exclude_none=True)
+                extra = f.pop("extra", {})
+                if isinstance(extra, dict):
+                    filters_json = {**filters_json, **f, **extra}
+                else:
+                    filters_json = {**filters_json, **f}
+        except Exception as e:
+            logger.warning("Query intelligence failed, using raw query: %s", e)
 
     try:
-        query_embedding = get_embedding(query_text)
+        if len(queries) == 1:
+            query_embedding = get_embedding(queries[0])
+            raw = query_collection(
+                project_id=body.project_id,
+                query_embedding=query_embedding,
+                n_results=body.k,
+            )
+        else:
+            query_embeddings = [get_embedding(q) for q in queries]
+            raw = query_collection_multi(
+                project_id=body.project_id,
+                query_embeddings=query_embeddings,
+                n_results_per_query=max(5, body.k // len(query_embeddings)),
+                total_results=body.k,
+            )
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    raw = query_collection(
-        project_id=body.project_id,
-        query_embedding=query_embedding,
-        n_results=body.k,
-    )
-
-    # Chroma returns lists of lists (one per query); we sent one query
+    # Chroma returns lists of lists (one per query); we use first row
     ids = (raw.get("ids") or [[]])[0]
     documents = (raw.get("documents") or [[]])[0]
     metadatas = (raw.get("metadatas") or [[]])[0]
@@ -439,17 +490,23 @@ def search(body: SearchRequest, db: DbSession, current_user: CurrentUserOptional
             )
 
     latency_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
     try:
         _save_search_query(
             db,
             actor_user_id=current_user.id if current_user else None,
-            project_id=body.project_id,
+            conversation_id=conv_id,
             query_text=query_text,
             k=body.k,
             results_count=len(results),
             latency_ms=latency_ms,
-            filters_json=body.filters_json,
+            filters_json=filters_json,
         )
+        try:
+            actor = (getattr(current_user, "name", None) or getattr(current_user, "email", None)) if current_user else "User"
+            log_activity(db, actor=actor or "User", event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("Failed to save search query to DB: %s", e)
 
@@ -458,6 +515,10 @@ def search(body: SearchRequest, db: DbSession, current_user: CurrentUserOptional
         project_id=body.project_id,
         k=body.k,
         results=results,
+        advanced_search_used=advanced_search_used,
+        cleaned_query=cleaned_query,
+        clarification_needed=clarification_needed,
+        clarification_questions=clarification_questions,
     )
 
 
@@ -467,6 +528,7 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUserO
     ChromaDB semantic search → rerank with cross-encoder → GPT synthesis.
     Retrieve more chunks, rerank for accuracy, then synthesize.
     Saves the search to search_queries table.
+    When advanced_search=True, runs Query Intelligence Layer first (cleanup, intent, split, rewrite, etc.).
     """
     query_text = (body.query_text or "").strip()
     if not query_text:
@@ -479,9 +541,50 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUserO
         )
 
     t0 = datetime.now(timezone.utc)
+    advanced_search_used = bool(body.advanced_search)
+    cleaned_query: str | None = None
+    clarification_needed = False
+    clarification_questions: list[str] = []
+    filters_json = body.filters_json
+    queries = [query_text]
+
+    if body.advanced_search:
+        try:
+            iq = run_query_intelligence(query_text)
+            query_text = iq.cleaned_query or query_text
+            cleaned_query = iq.cleaned_query or None
+            clarification_needed = iq.clarification_status == "clarification_needed"
+            clarification_questions = list(iq.suggested_clarification_questions or [])
+            queries = iq.queries_for_retrieval[:6] if iq.queries_for_retrieval else [query_text]
+            if iq.filters:
+                filters_json = filters_json or {}
+                f = iq.filters.model_dump(exclude_none=True)
+                extra = f.pop("extra", {})
+                if isinstance(extra, dict):
+                    filters_json = {**filters_json, **f, **extra}
+                else:
+                    filters_json = {**filters_json, **f}
+        except Exception as e:
+            logger.warning("Query intelligence failed, using raw query: %s", e)
 
     try:
-        query_embedding = get_embedding(query_text)
+        if len(queries) == 1:
+            query_embedding = get_embedding(queries[0])
+            retrieve_k = min(max(body.k * 2, 15), 25)
+            raw = query_collection(
+                project_id=body.project_id,
+                query_embedding=query_embedding,
+                n_results=retrieve_k,
+            )
+        else:
+            query_embeddings = [get_embedding(q) for q in queries]
+            retrieve_k = min(max(body.k * 2, 15), 25)
+            raw = query_collection_multi(
+                project_id=body.project_id,
+                query_embeddings=query_embeddings,
+                n_results_per_query=max(5, retrieve_k // len(query_embeddings)),
+                total_results=retrieve_k,
+            )
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -492,14 +595,6 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUserO
                 detail="Embedding service auth failed. If using a gateway (e.g. Druid), set OPENAI_BASE_URL and ensure the token is valid for that gateway.",
             )
         raise HTTPException(status_code=503, detail=f"Embedding failed: {err_msg}")
-
-    # Retrieve more chunks, then rerank for accuracy (stronger algorithm)
-    retrieve_k = min(max(body.k * 2, 15), 25)
-    raw = query_collection(
-        project_id=body.project_id,
-        query_embedding=query_embedding,
-        n_results=retrieve_k,
-    )
 
     ids = (raw.get("ids") or [[]])[0]
     documents = (raw.get("documents") or [[]])[0]
@@ -592,16 +687,18 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUserO
 
     latency_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
     search_query_id: int | None = None
+    conversation_id_out: str | None = None
+    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
     try:
         sq_row = _save_search_query(
             db,
             actor_user_id=current_user.id if current_user else None,
-            project_id=body.project_id,
+            conversation_id=conv_id,
             query_text=query_text,
             k=body.k,
             results_count=len(results),
             latency_ms=latency_ms,
-            filters_json=body.filters_json,
+            filters_json=filters_json,
             answer=answer,
             topic=topic_for_db,
             sources_json=sources_for_db,
@@ -612,6 +709,12 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUserO
         )
         if sq_row:
             search_query_id = sq_row.id
+            conversation_id_out = sq_row.conversation_id
+        try:
+            actor = (getattr(current_user, "name", None) or getattr(current_user, "email", None)) if current_user else "User"
+            log_activity(db, actor=actor or "User", event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("Failed to save search query to DB: %s", e)
 
@@ -625,6 +728,11 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUserO
         sources=sources,
         confidence=confidence,
         search_query_id=search_query_id,
+        conversation_id=conversation_id_out,
+        advanced_search_used=advanced_search_used,
+        cleaned_query=cleaned_query,
+        clarification_needed=clarification_needed,
+        clarification_questions=clarification_questions,
     )
 
 
@@ -744,11 +852,12 @@ def search_chat(body: SearchChatRequest, db: DbSession, current_user: CurrentUse
     )
 
     latency_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
     try:
         _save_search_query(
             db,
             actor_user_id=current_user.id if current_user else None,
-            project_id=body.project_id,
+            conversation_id=conv_id,
             query_text=query_text,
             k=body.k,
             results_count=len(results),
@@ -762,6 +871,11 @@ def search_chat(body: SearchChatRequest, db: DbSession, current_user: CurrentUse
             answer_status=answer_status,
             no_answer_reason=no_answer_reason,
         )
+        try:
+            actor = (getattr(current_user, "name", None) or getattr(current_user, "email", None)) if current_user else "User"
+            log_activity(db, actor=actor or "User", event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("Failed to save search query to DB: %s", e)
 
@@ -787,6 +901,7 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
     """
     Agentic RAG pipeline: query understanding → query rewriting → multi-query retrieval
     → evidence bundling → reranking → answer synthesis → self-check.
+    When advanced_search=True, uses Query Intelligence Layer (cleanup, intent, split, rewrite, domain, filters, clarification, plan).
     """
     query_text = (body.query_text or "").strip()
     if not query_text:
@@ -799,14 +914,33 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
         )
 
     t0 = datetime.now(timezone.utc)
+    advanced_search_used = bool(body.advanced_search)
+    cleaned_query: str | None = None
+    intelligence_clarification_questions: list[str] = []
+    query_analysis: dict = {}
+    search_queries: list[str] = [query_text]
 
-    # Layer 1 + 2: Query understanding + rewriting
-    try:
-        query_analysis, search_queries = analyze_and_rewrite_query(query_text)
-    except Exception as e:
-        logger.warning("Query analysis failed, using original: %s", e)
-        query_analysis = {}
-        search_queries = [query_text]
+    if body.advanced_search:
+        try:
+            iq = run_query_intelligence(query_text)
+            query_text = iq.cleaned_query or query_text
+            cleaned_query = iq.cleaned_query or None
+            intelligence_clarification_questions = list(iq.suggested_clarification_questions or [])
+            query_analysis = iq.to_query_analysis_dict()
+            search_queries = iq.queries_for_retrieval[:6] if iq.queries_for_retrieval else [query_text]
+        except Exception as e:
+            logger.warning("Query intelligence failed, falling back to analyze_and_rewrite: %s", e)
+            try:
+                query_analysis, search_queries = analyze_and_rewrite_query(query_text)
+            except Exception as e2:
+                logger.warning("Query analysis failed, using original: %s", e2)
+                search_queries = [query_text]
+    else:
+        try:
+            query_analysis, search_queries = analyze_and_rewrite_query(query_text)
+        except Exception as e:
+            logger.warning("Query analysis failed, using original: %s", e)
+            search_queries = [query_text]
 
     # Multi-query retrieval: embed each variant and merge with RRF
     try:
@@ -897,6 +1031,10 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
         except Exception as e:
             logger.warning("Self-check failed: %s", e)
 
+    # Query Intelligence can also suggest clarification
+    if intelligence_clarification_questions:
+        clarification_suggested = True
+
     # Build chunk_ids for sources (reranked order may differ from raw ids)
     chroma_ids_for_sources = [
         f"doc_{r.document_id}_chunk_{r.chunk_index}" for r in results
@@ -935,11 +1073,13 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
     )
     latency_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
     search_query_id: int | None = None
+    conversation_id_out: str | None = None
+    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
     try:
         sq_row = save_reasoning_search(
             db,
             actor_user_id=current_user.id if current_user else None,
-            project_id=body.project_id,
+            conversation_id=conv_id,
             query_text=query_text,
             k=body.k,
             results_count=len(results),
@@ -954,6 +1094,12 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
         )
         if sq_row:
             search_query_id = sq_row.id
+            conversation_id_out = sq_row.conversation_id
+        try:
+            actor = (getattr(current_user, "name", None) or getattr(current_user, "email", None)) if current_user else "User"
+            log_activity(db, actor=actor or "User", event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("Failed to save reasoning search to DB: %s", e)
 
@@ -962,6 +1108,7 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
         project_id=body.project_id,
         results=results,
         answer=answer,
+        conversation_id=conversation_id_out,
         topics_covered=topics_covered,
         sources=sources,
         confidence=confidence_obj,
@@ -971,7 +1118,10 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
         self_check_passed=self_check_passed,
         self_check_issues=self_check_issues,
         clarification_suggested=clarification_suggested,
+        clarification_questions=intelligence_clarification_questions,
         search_query_id=search_query_id,
+        advanced_search_used=advanced_search_used,
+        cleaned_query=cleaned_query,
     )
 
 
@@ -988,20 +1138,39 @@ def _reasoning_stream_generator(
     """
     Generator that runs the reasoning pipeline and yields SSE events.
     Same logic as search_reasoning, with status/search_query/confidence/result events.
+    When advanced_search=True, uses Query Intelligence Layer.
     """
     query_text = (body.query_text or "").strip()
     t0 = datetime.now(timezone.utc)
+    advanced_search_used = bool(body.advanced_search)
+    cleaned_query: str | None = None
+    intelligence_clarification_questions: list[str] = []
+    query_analysis: dict = {}
+    search_queries: list[str] = [query_text]
 
     try:
         yield _sse("status", {"step": "thinking", "message": "Analyzing your question..."})
 
-        # Layer 1 + 2: Query understanding + rewriting
-        try:
-            query_analysis, search_queries = analyze_and_rewrite_query(query_text)
-        except Exception as e:
-            logger.warning("Query analysis failed, using original: %s", e)
-            query_analysis = {}
-            search_queries = [query_text]
+        if body.advanced_search:
+            try:
+                iq = run_query_intelligence(query_text)
+                query_text = iq.cleaned_query or query_text
+                cleaned_query = iq.cleaned_query or None
+                intelligence_clarification_questions = list(iq.suggested_clarification_questions or [])
+                query_analysis = iq.to_query_analysis_dict()
+                search_queries = iq.queries_for_retrieval[:6] if iq.queries_for_retrieval else [query_text]
+            except Exception as e:
+                logger.warning("Query intelligence failed in stream, falling back: %s", e)
+                try:
+                    query_analysis, search_queries = analyze_and_rewrite_query(query_text)
+                except Exception:
+                    search_queries = [query_text]
+        else:
+            try:
+                query_analysis, search_queries = analyze_and_rewrite_query(query_text)
+            except Exception as e:
+                logger.warning("Query analysis failed, using original: %s", e)
+                search_queries = [query_text]
 
         if query_analysis:
             yield _sse("query_analysis", {
@@ -1079,6 +1248,20 @@ def _reasoning_stream_generator(
                 for c in chunk_dicts
             ]
 
+        # Emit search results for the reasoning log (questions + results)
+        search_results_payload = {
+            "total": len(results),
+            "items": [
+                {
+                    "filename": r.filename,
+                    "score": round(r.score, 4),
+                    "preview": (r.content[:150] + "…") if len(r.content) > 150 else r.content,
+                }
+                for r in results[:20]
+            ],
+        }
+        yield _sse("search_results", search_results_payload)
+
         yield _sse("status", {"step": "synthesizing", "message": "Synthesizing answer..."})
 
         answer, topics_covered, confidence, uncertainty_note, missing_info_note = (
@@ -1096,6 +1279,8 @@ def _reasoning_stream_generator(
                 )
             except Exception as e:
                 logger.warning("Self-check failed: %s", e)
+        if intelligence_clarification_questions:
+            clarification_suggested = True
 
         chroma_ids_for_sources = [
             f"doc_{r.document_id}_chunk_{r.chunk_index}" for r in results
@@ -1136,11 +1321,13 @@ def _reasoning_stream_generator(
         )
         latency_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
         search_query_id: int | None = None
+        conversation_id_out: str | None = None
+        conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
         try:
             sq_row = save_reasoning_search(
                 db,
                 actor_user_id=current_user.id if current_user else None,
-                project_id=body.project_id,
+                conversation_id=conv_id,
                 query_text=query_text,
                 k=body.k,
                 results_count=len(results),
@@ -1155,6 +1342,12 @@ def _reasoning_stream_generator(
             )
             if sq_row:
                 search_query_id = sq_row.id
+                conversation_id_out = sq_row.conversation_id
+            try:
+                actor = (getattr(current_user, "name", None) or getattr(current_user, "email", None)) if current_user else "User"
+                log_activity(db, actor=actor or "User", event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
+            except Exception:
+                pass
         except Exception as e:
             logger.warning("Failed to save reasoning search to DB: %s", e)
 
@@ -1163,6 +1356,7 @@ def _reasoning_stream_generator(
             project_id=body.project_id,
             results=results,
             answer=answer,
+            conversation_id=conversation_id_out,
             topics_covered=topics_covered,
             sources=sources,
             confidence=confidence_obj,
@@ -1172,7 +1366,10 @@ def _reasoning_stream_generator(
             self_check_passed=self_check_passed,
             self_check_issues=self_check_issues_list,
             clarification_suggested=clarification_suggested,
+            clarification_questions=intelligence_clarification_questions,
             search_query_id=search_query_id,
+            advanced_search_used=advanced_search_used,
+            cleaned_query=cleaned_query,
         )
         yield _sse("result", response.model_dump(mode="json"))
 
@@ -1255,12 +1452,12 @@ def get_intelligence_hub(db: DbSession, project_id: str | None = None):
     recent_docs: list[IntelligenceHubRecentDoc] = []
 
     if pid:
-        # Fetch recent search queries (last 30 days) for aggregation
+        # Fetch recent search queries (last 30 days) for aggregation (search_queries are global; no project_id)
         cutoff = datetime.now(timezone.utc) - timedelta(days=30)
         q = (
             select(SearchQuery)
-            .where(SearchQuery.project_id == pid, SearchQuery.ts >= cutoff)
-            .order_by(SearchQuery.ts.desc())
+            .where(SearchQuery.datetime_ >= cutoff)
+            .order_by(SearchQuery.datetime_.desc())
             .limit(500)
         )
         queries = list(db.execute(q).scalars().all())
@@ -1360,12 +1557,19 @@ def get_intelligence_hub(db: DbSession, project_id: str | None = None):
 
 @router.get("/queries", response_model=list[SearchQueryResponse])
 def list_search_queries(db: DbSession, project_id: str | None = None, skip: int = 0, limit: int = 100):
-    """List recent search queries, optionally filtered by project."""
-    q = select(SearchQuery).order_by(SearchQuery.ts.desc()).offset(skip).limit(limit)
-    if project_id:
-        q = q.where(SearchQuery.project_id == project_id)
+    """List recent search queries (search_queries table has no project_id; parameter kept for API compatibility)."""
+    q = select(SearchQuery).order_by(SearchQuery.datetime_.desc()).offset(skip).limit(limit)
     rows = db.execute(q).scalars().all()
     return list(rows)
+
+
+@router.get("/queries/{search_query_id}", response_model=SearchQueryResponse)
+def get_search_query(search_query_id: int, db: DbSession):
+    """Get a single search query by id (for conversation log detail)."""
+    sq = db.execute(select(SearchQuery).where(SearchQuery.id == search_query_id)).scalars().one_or_none()
+    if not sq:
+        raise HTTPException(status_code=404, detail="Search query not found")
+    return sq
 
 
 @router.patch("/queries/{search_query_id}/feedback", response_model=SearchQueryResponse)

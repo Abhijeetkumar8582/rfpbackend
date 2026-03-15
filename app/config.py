@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     # PDF OCR (optional: path to Tesseract executable if not in PATH, e.g. C:/Program Files/Tesseract-OCR/tesseract.exe)
     tesseract_cmd: str = ""
 
+    # SendGrid (email)
+    sendgrid_api_key: str = ""
+    sendgrid_from_email: str = "noreply@example.com"
+    sendgrid_from_name: str = "RFP Backend"
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

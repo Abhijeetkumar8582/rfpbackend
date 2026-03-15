@@ -79,6 +79,85 @@ def _gpt_json(messages: list[dict], max_tokens: int = 2048) -> dict:
         return {}
 
 
+def validate_faq_answers(
+    items: list[tuple[int, str, str]],
+) -> list[dict]:
+    """
+    For each (search_query_id, question, answer), ask LLM to rate 0-100 how well
+    the answer addresses the question. Returns list of { search_query_id, confidence }.
+    """
+    if not items:
+        return []
+    url = (settings.openai_base_url or "").strip()
+    token = (settings.openai_api_key or "").strip()
+    if not url or not token:
+        raise RuntimeError("OPENAI_BASE_URL and OPENAI_API_KEY are required.")
+
+    parts = []
+    for i, (sid, q, a) in enumerate(items, 1):
+        q_short = (_sanitize_text(q) or "N/A")[:500]
+        a_short = (_sanitize_text(a) or "N/A")[:500]
+        parts.append(f"Pair {i}:\nQuestion: {q_short}\nAnswer: {a_short}")
+    prompt = """You are a validator. For each pair below, rate how well the Answer addresses the Question (relevance and correctness). Reply with a JSON object with a single key "scores" whose value is an array of integers from 0 to 100, one per pair, in the same order. Only output valid JSON, no other text.
+
+"""
+    prompt += "\n\n".join(parts)
+    prompt += "\n\nOutput format: {\"scores\": [n1, n2, ...]}"
+
+    body = {
+        "model": settings.openai_chat_model,
+        "messages": [
+            {"role": "system", "content": "You output only valid JSON. No markdown, no explanation."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 512,
+    }
+    if getattr(settings, "openai_send_model_in_body", True):
+        body["model"] = settings.openai_chat_model
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    with httpx.Client(timeout=60.0) as client:
+        r = client.post(url, json=body, headers=headers)
+
+    if r.status_code >= 400:
+        logger.error("FAQ validation GPT returned %s: %s", r.status_code, (r.text or "")[:500])
+        raise RuntimeError(f"Validation failed: {r.status_code}")
+
+    data = r.json()
+    choice = (data.get("choices") or [None])[0]
+    content = (choice.get("message") or {}).get("content") if choice else ""
+    text = (content or "").strip()
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    if match:
+        text = match.group(1).strip()
+    scores = []
+    try:
+        parsed = json.loads(text)
+        scores = parsed.get("scores") or parsed.get("Scores") or []
+    except json.JSONDecodeError:
+        arr = re.search(r"\[\s*\d+\s*(?:,\s*\d+\s*)*\]", text)
+        if arr:
+            try:
+                scores = json.loads(arr.group(0))
+            except json.JSONDecodeError:
+                pass
+
+    ids = [x[0] for x in items]
+    while len(scores) < len(ids):
+        scores.append(0)
+    results = []
+    for i, sid in enumerate(ids):
+        sc = scores[i] if i < len(scores) else 0
+        if not isinstance(sc, (int, float)):
+            try:
+                sc = int(float(str(sc)))
+            except (ValueError, TypeError):
+                sc = 0
+        sc = max(0, min(100, int(sc)))
+        results.append({"search_query_id": sid, "confidence": sc})
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Layer 1 + 2: Query understanding and rewriting (single LLM call)
 # ---------------------------------------------------------------------------
@@ -94,7 +173,7 @@ def analyze_and_rewrite_query(question: str) -> tuple[dict, list[str]]:
 
 Analyze the user's question and produce:
 1. query_analysis: structured understanding
-2. search_queries: 3-6 alternative search strings to improve retrieval
+2. search_queries: 3-6 alternative search strings that are logical, specific, and detailed to improve retrieval
 
 Respond with valid JSON only. Use this exact structure:
 {
@@ -107,15 +186,20 @@ Respond with valid JSON only. Use this exact structure:
   },
   "search_queries": [
     "original or slightly cleaned query",
-    "expanded/semantic query",
-    "keyword-heavy query with important terms",
+    "expanded/semantic query with key concepts",
+    "detailed keyword-heavy query with important terms",
     "policy/clause-style phrasing",
     "alternative formulation"
   ]
 }
 
-- search_queries: 3-6 strings. Include the original question as first element. Make others diverse: semantic, keyword-focused, formal/policy language.
-- Keep each query under 100 chars.
+- query_analysis: Be precise. For missing_constraints, list concrete details that would narrow the search (e.g. region, employee type, effective date).
+- search_queries: 3-6 strings. Each query must be:
+  * Logical: clearly express one coherent intent; avoid vague or fragmented phrasing.
+  * Detailed: include key concepts, criteria, or scope (e.g. "SLA uptime guarantees and penalties for enterprise contracts" not just "SLA").
+  * Specific: name policy areas, document types, or conditions when relevant (e.g. "remote work policy for full-time employees" not just "remote work").
+  Include the original question as the first element. Make others diverse: full semantic phrasing, keyword-rich detailed query, formal/policy language, and one that spells out assumptions or context.
+  Keep each query under 200 characters so they remain detailed but usable for search.
 """
 
     user = f"Question: {_sanitize_text(question)[:500]}"
@@ -426,7 +510,7 @@ def save_reasoning_search(
     db: "Session",
     *,
     actor_user_id: str | None,
-    project_id: str,
+    conversation_id: str,
     query_text: str,
     k: int,
     results_count: int,
@@ -443,9 +527,9 @@ def save_reasoning_search(
     from app.models.search_query import SearchQuery
 
     row = SearchQuery(
-        ts=datetime.now(timezone.utc),
+        datetime_=datetime.now(timezone.utc),
+        conversation_id=conversation_id,
         actor_user_id=actor_user_id,
-        project_id=project_id,
         query_text=query_text,
         k=k,
         filters_json=None,

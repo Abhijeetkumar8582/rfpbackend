@@ -1,6 +1,6 @@
 """Search schemas."""
 from datetime import datetime
-from pydantic import BaseModel, field_validator, field_validator, field_validator
+from pydantic import BaseModel, Field, field_validator, field_validator, field_validator
 
 
 class SearchRequest(BaseModel):
@@ -8,6 +8,8 @@ class SearchRequest(BaseModel):
     project_id: str
     k: int = 5
     filters_json: dict | None = None
+    advanced_search: bool = False  # When True, run Query Intelligence Layer before retrieval
+    conversation_id: str | None = None  # Optional; same id for follow-up queries (valid 24h)
 
 
 class SearchResultItem(BaseModel):
@@ -46,6 +48,11 @@ class SearchResponse(BaseModel):
     project_id: str
     k: int
     results: list[SearchResultItem]
+    # Advanced search (Query Intelligence) — optional
+    advanced_search_used: bool = False
+    cleaned_query: str | None = None
+    clarification_needed: bool = False
+    clarification_questions: list[str] = []
 
 
 class SearchAnswerResponse(BaseModel):
@@ -59,6 +66,12 @@ class SearchAnswerResponse(BaseModel):
     sources: list[SourceItem] = []
     confidence: ConfidenceScores = ConfidenceScores()
     search_query_id: int | None = None  # For feedback submission
+    conversation_id: str | None = None  # Set when search is saved; use for follow-up queries
+    # Advanced search (Query Intelligence) — optional
+    advanced_search_used: bool = False
+    cleaned_query: str | None = None
+    clarification_needed: bool = False
+    clarification_questions: list[str] = []
 
 
 class ChatMessage(BaseModel):
@@ -114,9 +127,8 @@ class SearchFeedbackRequest(BaseModel):
 
 class SearchQueryResponse(BaseModel):
     id: int
-    ts: datetime
+    datetime_: datetime = Field(serialization_alias="ts")  # model column "datetime"; alias for API compat
     actor_user_id: str | None
-    project_id: str
     query_text: str
     k: int
     results_count: int
@@ -148,6 +160,8 @@ class ReasoningRequest(BaseModel):
     k: int = 20  # Chunks to retrieve (before reranking)
     top_k: int = 12  # After reranking, how many to pass to synthesis
     skip_self_check: bool = False  # Optional: skip self-check for faster response
+    advanced_search: bool = False  # When True, use Query Intelligence Layer (cleanup, intent, split, rewrite, domain, filters, clarification, plan)
+    conversation_id: str | None = None  # Optional; same id for follow-up queries (valid 24h)
 
 
 class QueryAnalysis(BaseModel):
@@ -215,4 +229,8 @@ class ReasoningResponse(BaseModel):
     self_check_passed: bool = True
     self_check_issues: list[str] = []
     clarification_suggested: bool = False
+    clarification_questions: list[str] = []  # From Query Intelligence when advanced_search and clarification_needed
     search_query_id: int | None = None  # For feedback submission
+    conversation_id: str | None = None  # Set when search is saved; use for follow-up queries
+    advanced_search_used: bool = False
+    cleaned_query: str | None = None

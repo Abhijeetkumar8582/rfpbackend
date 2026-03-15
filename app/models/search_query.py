@@ -5,17 +5,20 @@ from sqlalchemy import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
-from app.models.project import PROJECT_ID_LENGTH
 from app.models.user import USER_ID_LENGTH
+
+
+CONVERSATION_ID_LENGTH = 32  # conv_ (5) + ULID (26) = 31 chars, VARCHAR(32)
 
 
 class SearchQuery(Base):
     __tablename__ = "search_queries"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    datetime_: Mapped[datetime] = mapped_column("datetime", DateTime(timezone=True), nullable=False)
+    # Chat grouping: same conversation_id for follow-up queries; valid 24h from first query in conversation
+    conversation_id: Mapped[str] = mapped_column(String(CONVERSATION_ID_LENGTH), nullable=False)
     actor_user_id: Mapped[str | None] = mapped_column(String(USER_ID_LENGTH), ForeignKey("users.id"), nullable=True)
-    project_id: Mapped[str] = mapped_column(String(PROJECT_ID_LENGTH), ForeignKey("projects.id"), nullable=False)
     query_text: Mapped[str] = mapped_column(Text, nullable=False)
     k: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     filters_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -42,4 +45,4 @@ class SearchQuery(Base):
     feedback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def __repr__(self) -> str:
-        return f"<SearchQuery id={self.id} project_id={self.project_id}>"
+        return f"<SearchQuery id={self.id}>"

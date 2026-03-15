@@ -3,6 +3,7 @@ import enum
 from datetime import datetime
 from sqlalchemy import Boolean, DateTime, Enum, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.sql import quoted_name
 
 from app.database import Base
 
@@ -19,7 +20,7 @@ class UserRole(str, enum.Enum):
 
 
 class User(Base):
-    __tablename__ = "users"
+    __tablename__ = quoted_name("users", quote=True)  # MySQL: quote so "users" table name works
 
     id: Mapped[str] = mapped_column(String(USER_ID_LENGTH), primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
