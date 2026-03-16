@@ -25,3 +25,10 @@ class ActivityLogResponse(BaseModel):
     system: str
 
     model_config = {"from_attributes": True}
+
+
+class ActivityLogListResponse(BaseModel):
+    """Paginated activity logs with total and last-7-days count."""
+    items: list[ActivityLogResponse]
+    total: int
+    total_last_7_days: int

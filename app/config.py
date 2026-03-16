@@ -57,13 +57,18 @@ class Settings(BaseSettings):
     chunk_size_words: int = 200
     chunk_overlap_words: int = 30
 
-    # PDF OCR (optional: path to Tesseract executable if not in PATH, e.g. C:/Program Files/Tesseract-OCR/tesseract.exe)
+    # PDF OCR (optional: path to Tesseract executable if not in PATH, e.g. C:/ Program Files/Tesseract-OCR/tesseract.exe)
     tesseract_cmd: str = ""
 
     # SendGrid (email)
     sendgrid_api_key: str = ""
     sendgrid_from_email: str = "noreply@example.com"
     sendgrid_from_name: str = "RFP Backend"
+
+    # Frontend + invites
+    frontend_base_url: str = "http://localhost:3000"
+    product_name: str = "RFP Platform"
+    invite_token_hours: int = 48
 
     @property
     def cors_origins_list(self) -> list[str]:

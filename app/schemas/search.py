@@ -128,6 +128,7 @@ class SearchFeedbackRequest(BaseModel):
 class SearchQueryResponse(BaseModel):
     id: int
     datetime_: datetime = Field(serialization_alias="ts")  # model column "datetime"; alias for API compat
+    conversation_id: str  # Same id for all Q&A in one conversation; used to group and load full thread
     actor_user_id: str | None
     query_text: str
     k: int
@@ -205,6 +206,14 @@ class IntelligenceHubRecentDoc(BaseModel):
     size: str  # human-readable, e.g. "2.4 MB"
 
 
+class IndexHealth(BaseModel):
+    """Index health metrics for Intelligence Hub."""
+    documents_indexed_pct: int  # 0-100, % of project docs that are ingested/indexed
+    chunks_in_vector_db: int
+    embedding_quality: str  # "Good" | "Fair" | "Poor"
+    last_indexed_ago: str | None  # e.g. "5 min ago", or null if never indexed
+
+
 class IntelligenceHubResponse(BaseModel):
     """Intelligence Hub dashboard data from search_queries and documents."""
     most_searched_topics: list[IntelligenceHubTopic] = []
@@ -212,6 +221,7 @@ class IntelligenceHubResponse(BaseModel):
     high_confidence_areas: list[IntelligenceHubHighConfidence] = []
     gaps_in_knowledge: list[IntelligenceHubGap] = []
     recently_uploaded: list[IntelligenceHubRecentDoc] = []
+    index_health: IndexHealth | None = None
 
 
 class ReasoningResponse(BaseModel):

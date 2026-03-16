@@ -8,7 +8,8 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError
 
-from app.api.deps import DbSession
+from app.api.deps import DbSession, CurrentUserOptional, require_admin_or_manager
+from app.models.user import UserRole
 from app.core.document_id import generate_document_id
 from app.config import settings
 from app.database import SessionLocal
@@ -16,6 +17,19 @@ from app.models.document import Document, DocumentStatus
 from app.models.document_chunk import DocumentChunk
 from app.models.project import Project
 from app.models.user import User
+
+def _require_can_modify_document(current_user: User | None, doc: Document) -> None:
+    """Allow Super Admin, Admin, or the document uploader. Raise 401/403 otherwise."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if current_user.role in (UserRole.admin, UserRole.manager):
+        return
+    if doc.uploaded_by and doc.uploaded_by == current_user.id:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="Only Super Admin, Admin, or the document uploader can modify or delete this document.",
+    )
 from app.schemas.document import (
     DocumentResponse,
     DocumentUpdate,
@@ -150,6 +164,7 @@ def _run_generate_metadata_background(document_id: str) -> None:
 async def upload_document(
     db: DbSession,
     background_tasks: BackgroundTasks,
+    current_user: CurrentUserOptional,
     project_id: str = Form(...),
     uploaded_by: str = Form(..., description="User ID (UUID) who is uploading"),
     file: UploadFile = File(...),
@@ -157,8 +172,9 @@ async def upload_document(
 ):
     """
     Upload: extract text → chunk → embed → categorize → ChromaDB → S3.
-    Resilient: document is created even if OpenAI, S3, or ChromaDB fail.
+    Only Super Admin or Admin can upload. Resilient: document is created even if OpenAI, S3, or ChromaDB fail.
     """
+    require_admin_or_manager(current_user)
     logger.info("Document upload request received: filename=%s project_id=%s", file.filename, project_id)
     filename = file.filename or "document"
     content_type = file.content_type or "application/octet-stream"
@@ -391,13 +407,14 @@ def get_document(document_id: str, db: DbSession):
 
 
 @router.patch("/{document_id}", response_model=DocumentResponse)
-def update_document(document_id: str, body: DocumentUpdate, db: DbSession):
-    """Update document metadata (title, description, doc_type, tags, taxonomy). Soft-deleted docs return 404."""
+def update_document(document_id: str, body: DocumentUpdate, db: DbSession, current_user: CurrentUserOptional):
+    """Update document metadata (title, description, doc_type, tags, taxonomy). Admin/Super Admin or uploader only. Soft-deleted docs return 404."""
     doc = db.execute(select(Document).where(Document.id == document_id)).scalars().one_or_none()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at:
         raise HTTPException(status_code=404, detail="Document deleted")
+    _require_can_modify_document(current_user, doc)
 
     if body.doc_title is not None:
         doc.doc_title = body.doc_title
@@ -453,13 +470,14 @@ def download_document(document_id: str, db: DbSession):
 
 
 @router.delete("/{document_id}", response_model=Message)
-def delete_document(document_id: str, db: DbSession):
-    """Soft-delete document and remove chunks from ChromaDB."""
+def delete_document(document_id: str, db: DbSession, current_user: CurrentUserOptional):
+    """Soft-delete document and remove chunks from ChromaDB. Admin/Super Admin or uploader only."""
     doc = db.execute(select(Document).where(Document.id == document_id)).scalars().one_or_none()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at:
         return Message(message="Already deleted")
+    _require_can_modify_document(current_user, doc)
 
     doc.deleted_at = datetime.now(timezone.utc)
     doc.status = DocumentStatus.deleted

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Body, HTTPException
 from sqlalchemy import select
 
-from app.api.deps import DbSession
+from app.api.deps import DbSession, CurrentUserOptional, require_admin_or_manager
 from app.core.project_id import generate_project_id
 from app.models.project import Project
 from app.models.document import Document
@@ -78,12 +78,17 @@ def delete_project(project_id: str, db: DbSession):
 
 
 @router.post("/{project_id}/train-datasource", response_model=TrainDatasourceResponse)
-def train_datasource(project_id: str, db: DbSession, body: TrainDatasourceConfig | None = Body(None)):
+def train_datasource(
+    project_id: str,
+    db: DbSession,
+    current_user: CurrentUserOptional,
+    body: TrainDatasourceConfig | None = Body(None),
+):
     """
     Fetch all document chunks and their stored embeddings from the DB and push to ChromaDB.
-    Upload already stores chunks + embeddings in document_chunks; train re-syncs that data
-    into the project's Chroma collection (clear then add all). No re-embedding — uses DB embeddings.
+    Only Super Admin or Admin can train. No re-embedding — uses DB embeddings.
     """
+    require_admin_or_manager(current_user)
     project = db.execute(select(Project).where(Project.id == project_id, Project.is_deleted == False)).scalars().one_or_none()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")

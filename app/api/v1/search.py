@@ -3,15 +3,15 @@ import json
 import logging
 import os
 from collections import Counter
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import select, func
 
-from app.api.deps import DbSession, CurrentUserOptional
+from app.api.deps import DbSession, CurrentUser, CurrentUserOptional, require_admin_only
 from app.models.search_query import SearchQuery
-from app.models.document import Document
+from app.models.document import Document, DocumentStatus
 from app.models.project import Project
 from app.schemas.search import (
     SearchRequest,
@@ -33,9 +33,10 @@ from app.schemas.search import (
     IntelligenceHubHighConfidence,
     IntelligenceHubGap,
     IntelligenceHubRecentDoc,
+    IndexHealth,
 )
 from app.services.embeddings import get_embedding
-from app.services.chroma import query_collection, query_collection_multi
+from app.services.chroma import query_collection, query_collection_multi, get_collection_count
 from app.services.search_answer import answer_from_chunks
 from app.services.query_intelligence import run_query_intelligence
 from app.services.reasoning import (
@@ -404,7 +405,7 @@ def _compute_answer_status_and_reason(
 
 
 @router.post("/query", response_model=SearchResponse)
-def search(body: SearchRequest, db: DbSession, current_user: CurrentUserOptional):
+def search(body: SearchRequest, db: DbSession, current_user: CurrentUser):
     """
     Embed the question, search ChromaDB for the project's collection,
     return top-k chunks by similarity (question embedding vs stored chunk embeddings).
@@ -494,7 +495,7 @@ def search(body: SearchRequest, db: DbSession, current_user: CurrentUserOptional
     try:
         _save_search_query(
             db,
-            actor_user_id=current_user.id if current_user else None,
+            actor_user_id=current_user.id,
             conversation_id=conv_id,
             query_text=query_text,
             k=body.k,
@@ -503,7 +504,7 @@ def search(body: SearchRequest, db: DbSession, current_user: CurrentUserOptional
             filters_json=filters_json,
         )
         try:
-            actor = (getattr(current_user, "name", None) or getattr(current_user, "email", None)) if current_user else "User"
+            actor = getattr(current_user, "name", None) or getattr(current_user, "email", None) or "User"
             log_activity(db, actor=actor or "User", event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
         except Exception:
             pass
@@ -523,7 +524,7 @@ def search(body: SearchRequest, db: DbSession, current_user: CurrentUserOptional
 
 
 @router.post("/answer", response_model=SearchAnswerResponse)
-def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUserOptional):
+def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUser):
     """
     ChromaDB semantic search → rerank with cross-encoder → GPT synthesis.
     Retrieve more chunks, rerank for accuracy, then synthesize.
@@ -692,7 +693,7 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUserO
     try:
         sq_row = _save_search_query(
             db,
-            actor_user_id=current_user.id if current_user else None,
+            actor_user_id=current_user.id,
             conversation_id=conv_id,
             query_text=query_text,
             k=body.k,
@@ -711,8 +712,8 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUserO
             search_query_id = sq_row.id
             conversation_id_out = sq_row.conversation_id
         try:
-            actor = (getattr(current_user, "name", None) or getattr(current_user, "email", None)) if current_user else "User"
-            log_activity(db, actor=actor or "User", event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
+            actor = getattr(current_user, "name", None) or getattr(current_user, "email", None) or "User"
+            log_activity(db, actor=actor, event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
         except Exception:
             pass
     except Exception as e:
@@ -750,7 +751,7 @@ def _query_text_from_messages(messages: list) -> str:
 
 
 @router.post("/chat", response_model=SearchChatResponse)
-def search_chat(body: SearchChatRequest, db: DbSession, current_user: CurrentUserOptional):
+def search_chat(body: SearchChatRequest, db: DbSession, current_user: CurrentUser):
     """
     Chat/completion-style search: request body has `messages` (and project_id, k).
     Uses the last user message as the query, runs semantic search + GPT answer (RAG),
@@ -856,7 +857,7 @@ def search_chat(body: SearchChatRequest, db: DbSession, current_user: CurrentUse
     try:
         _save_search_query(
             db,
-            actor_user_id=current_user.id if current_user else None,
+            actor_user_id=current_user.id,
             conversation_id=conv_id,
             query_text=query_text,
             k=body.k,
@@ -872,8 +873,8 @@ def search_chat(body: SearchChatRequest, db: DbSession, current_user: CurrentUse
             no_answer_reason=no_answer_reason,
         )
         try:
-            actor = (getattr(current_user, "name", None) or getattr(current_user, "email", None)) if current_user else "User"
-            log_activity(db, actor=actor or "User", event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
+            actor = getattr(current_user, "name", None) or getattr(current_user, "email", None) or "User"
+            log_activity(db, actor=actor, event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
         except Exception:
             pass
     except Exception as e:
@@ -897,7 +898,7 @@ def search_chat(body: SearchChatRequest, db: DbSession, current_user: CurrentUse
 
 
 @router.post("/reasoning", response_model=ReasoningResponse)
-def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: CurrentUserOptional):
+def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: CurrentUser):
     """
     Agentic RAG pipeline: query understanding → query rewriting → multi-query retrieval
     → evidence bundling → reranking → answer synthesis → self-check.
@@ -1078,7 +1079,7 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
     try:
         sq_row = save_reasoning_search(
             db,
-            actor_user_id=current_user.id if current_user else None,
+            actor_user_id=current_user.id,
             conversation_id=conv_id,
             query_text=query_text,
             k=body.k,
@@ -1096,8 +1097,8 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
             search_query_id = sq_row.id
             conversation_id_out = sq_row.conversation_id
         try:
-            actor = (getattr(current_user, "name", None) or getattr(current_user, "email", None)) if current_user else "User"
-            log_activity(db, actor=actor or "User", event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
+            actor = getattr(current_user, "name", None) or getattr(current_user, "email", None) or "User"
+            log_activity(db, actor=actor, event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
         except Exception:
             pass
     except Exception as e:
@@ -1133,7 +1134,7 @@ def _sse(event: str, data: dict) -> str:
 def _reasoning_stream_generator(
     body: ReasoningRequest,
     db: DbSession,
-    current_user: CurrentUserOptional,
+    current_user: CurrentUser,
 ):
     """
     Generator that runs the reasoning pipeline and yields SSE events.
@@ -1326,7 +1327,7 @@ def _reasoning_stream_generator(
         try:
             sq_row = save_reasoning_search(
                 db,
-                actor_user_id=current_user.id if current_user else None,
+                actor_user_id=current_user.id,
                 conversation_id=conv_id,
                 query_text=query_text,
                 k=body.k,
@@ -1344,8 +1345,8 @@ def _reasoning_stream_generator(
                 search_query_id = sq_row.id
                 conversation_id_out = sq_row.conversation_id
             try:
-                actor = (getattr(current_user, "name", None) or getattr(current_user, "email", None)) if current_user else "User"
-                log_activity(db, actor=actor or "User", event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
+                actor = getattr(current_user, "name", None) or getattr(current_user, "email", None) or "User"
+                log_activity(db, actor=actor, event_action="Search query", target_resource=query_text[:200] + ("…" if len(query_text) > 200 else ""), severity="info", system="web")
             except Exception:
                 pass
         except Exception as e:
@@ -1379,7 +1380,7 @@ def _reasoning_stream_generator(
 
 
 @router.post("/reasoning/stream")
-def search_reasoning_stream(body: ReasoningRequest, db: DbSession, current_user: CurrentUserOptional):
+def search_reasoning_stream(body: ReasoningRequest, db: DbSession, current_user: CurrentUser):
     """
     Same as POST /reasoning but returns Server-Sent Events: status, query_analysis,
     search_query (per generated query), confidence, then result (full ReasoningResponse).
@@ -1546,30 +1547,137 @@ def get_intelligence_hub(db: DbSession, project_id: str | None = None):
                 )
             )
 
+    # Index health: only when we have a project
+    index_health: IndexHealth | None = None
+    if pid:
+        total_docs = db.execute(
+            select(func.count()).select_from(Document).where(
+                Document.project_id == pid, Document.deleted_at.is_(None)
+            )
+        ).scalar() or 0
+        ingested_count = db.execute(
+            select(func.count()).select_from(Document).where(
+                Document.project_id == pid,
+                Document.deleted_at.is_(None),
+                Document.status == DocumentStatus.ingested,
+            )
+        ).scalar() or 0
+        documents_indexed_pct = int(round((ingested_count / total_docs * 100))) if total_docs else 0
+        chunks_in_vector_db = get_collection_count(pid)
+        last_indexed_ago = None
+        last_row = db.execute(
+            select(Document.ingested_at)
+            .where(
+                Document.project_id == pid,
+                Document.deleted_at.is_(None),
+                Document.status == DocumentStatus.ingested,
+                Document.ingested_at.isnot(None),
+            )
+            .order_by(Document.ingested_at.desc())
+            .limit(1)
+        ).first()
+        if last_row and last_row[0]:
+            last_indexed_ago = _format_time_ago(last_row[0])
+        if documents_indexed_pct >= 90 and chunks_in_vector_db > 0:
+            embedding_quality = "Good"
+        elif documents_indexed_pct >= 50 or chunks_in_vector_db > 0:
+            embedding_quality = "Fair"
+        else:
+            embedding_quality = "Poor"
+        index_health = IndexHealth(
+            documents_indexed_pct=documents_indexed_pct,
+            chunks_in_vector_db=chunks_in_vector_db,
+            embedding_quality=embedding_quality,
+            last_indexed_ago=last_indexed_ago,
+        )
+
     return IntelligenceHubResponse(
         most_searched_topics=most_searched,
         low_confidence_areas=low_confidence,
         high_confidence_areas=high_confidence,
         gaps_in_knowledge=gaps,
         recently_uploaded=recent_docs,
+        index_health=index_health,
     )
 
 
 @router.get("/queries", response_model=list[SearchQueryResponse])
-def list_search_queries(db: DbSession, project_id: str | None = None, skip: int = 0, limit: int = 100):
-    """List recent search queries (search_queries table has no project_id; parameter kept for API compatibility)."""
-    q = select(SearchQuery).order_by(SearchQuery.datetime_.desc()).offset(skip).limit(limit)
+def list_search_queries(
+    db: DbSession,
+    current_user: CurrentUserOptional,
+    project_id: str | None = None,
+    on_date: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    skip: int = 0,
+    limit: int = 100,
+):
+    """List search queries (Conversation Log). Admin/Super Admin only. Use from_date and to_date (YYYY-MM-DD) for a range, or on_date for a single day. Default: today."""
+    require_admin_only(current_user)
+    now = datetime.now(timezone.utc).date()
+    try:
+        if from_date and to_date:
+            start_date = date.fromisoformat(from_date)
+            end_date = date.fromisoformat(to_date)
+            if start_date > end_date:
+                start_date, end_date = end_date, start_date
+            day_start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc)
+            day_end = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
+            end_inclusive = True
+        elif on_date is not None:
+            filter_date = date.fromisoformat(on_date)
+            day_start = datetime(filter_date.year, filter_date.month, filter_date.day, tzinfo=timezone.utc)
+            day_end = day_start + timedelta(days=1)
+            end_inclusive = False
+        else:
+            day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+            day_end = day_start + timedelta(days=1)
+            end_inclusive = False
+    except (ValueError, TypeError):
+        day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        day_end = day_start + timedelta(days=1)
+        end_inclusive = False
+    if end_inclusive:
+        q = (
+            select(SearchQuery)
+            .where(SearchQuery.datetime_ >= day_start, SearchQuery.datetime_ <= day_end)
+            .order_by(SearchQuery.datetime_.desc())
+            .offset(skip)
+            .limit(limit)
+        )
+    else:
+        q = (
+            select(SearchQuery)
+            .where(SearchQuery.datetime_ >= day_start, SearchQuery.datetime_ < day_end)
+            .order_by(SearchQuery.datetime_.desc())
+            .offset(skip)
+            .limit(limit)
+        )
     rows = db.execute(q).scalars().all()
     return list(rows)
 
 
 @router.get("/queries/{search_query_id}", response_model=SearchQueryResponse)
-def get_search_query(search_query_id: int, db: DbSession):
-    """Get a single search query by id (for conversation log detail)."""
+def get_search_query(search_query_id: int, db: DbSession, current_user: CurrentUserOptional):
+    """Get a single search query by id (for conversation log detail). Admin/Super Admin only."""
+    require_admin_only(current_user)
     sq = db.execute(select(SearchQuery).where(SearchQuery.id == search_query_id)).scalars().one_or_none()
     if not sq:
         raise HTTPException(status_code=404, detail="Search query not found")
     return sq
+
+
+@router.get("/queries/by-conversation/{conversation_id}", response_model=list[SearchQueryResponse])
+def list_search_queries_by_conversation(conversation_id: str, db: DbSession, current_user: CurrentUserOptional):
+    """List all search queries (Q&A pairs) for a conversation, ordered by time. Admin/Super Admin only. Use for conversation log detail."""
+    require_admin_only(current_user)
+    q = (
+        select(SearchQuery)
+        .where(SearchQuery.conversation_id == conversation_id)
+        .order_by(SearchQuery.datetime_.asc())
+    )
+    rows = db.execute(q).scalars().all()
+    return list(rows)
 
 
 @router.patch("/queries/{search_query_id}/feedback", response_model=SearchQueryResponse)

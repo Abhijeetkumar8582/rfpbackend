@@ -1,8 +1,20 @@
-"""Auth API — login, signup, refresh, logout."""
+"""Auth API — login, refresh, logout, invite completion."""
+import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
+
+logger = logging.getLogger(__name__)
+
+
+def _utc(dt: datetime | None) -> datetime | None:
+    """Normalize to UTC for comparison. MySQL may return naive or session-timezone datetimes."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 from app.api.deps import DbSession
 from app.services.activity_log import log_activity
@@ -12,38 +24,17 @@ from app.core.security import (
     create_access_token,
     create_refresh_token_pair,
     decode_token,
+    decode_invite_token,
     hash_refresh_token,
 )
-from app.core.user_id import generate_user_id
 from app.models.user import User
 from app.models.refresh_token import RefreshToken
-from app.models.user import UserRole
-from app.schemas.user import UserCreate, UserLogin, UserResponse, TokenResponse, RefreshBody
+from app.models.user_invite import UserInvite
+from app.schemas.user import UserLogin, UserResponse, TokenResponse, RefreshBody
+from app.schemas.invite import InviteValidateResponse, InviteCompleteRequest
 from app.schemas.common import Message
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-
-@router.post("/register", response_model=UserResponse)
-def register(body: UserCreate, db: DbSession):
-    """Register a new user."""
-    existing = db.execute(select(User).where(User.email == body.email)).scalars().one_or_none()
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    user = User(
-        id=generate_user_id(),
-        email=body.email,
-        name=body.name,
-        password_hash=hash_password(body.password),
-        role=UserRole.viewer,
-        is_active=True,
-        created_at=datetime.now(timezone.utc),
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -177,3 +168,117 @@ def logout(body: RefreshBody, db: DbSession):
                 refresh_row.revoked_at = datetime.now(timezone.utc)
                 db.commit()
     return Message(message="OK")
+
+
+@router.get("/invite/validate", response_model=InviteValidateResponse)
+def validate_invite(token: str, db: DbSession):
+    """
+    Validate an invite JWT (unauthenticated). Verifies signature and exp, then checks DB for one-time use/revocation.
+
+    Returns safe user info if valid, 400 if invalid/expired/used.
+    """
+    payload = decode_invite_token(token)
+    if not payload:
+        raise HTTPException(status_code=400, detail="Invalid or expired invite token")
+
+    invite = db.execute(
+        select(UserInvite).where(
+            UserInvite.token == token,
+            UserInvite.revoked.is_(False),
+        )
+    ).scalars().one_or_none()
+    if not invite or invite.used_at is not None:
+        raise HTTPException(status_code=400, detail="Invalid or expired invite token")
+
+    # Return email/name from JWT payload (already verified)
+    exp_ts = payload.get("exp")
+    expires_at = datetime.fromtimestamp(exp_ts, tz=timezone.utc) if exp_ts else invite.expires_at
+    return InviteValidateResponse(
+        email=payload["email"],
+        name=payload.get("name") or "",
+        expires_at=expires_at,
+    )
+
+
+@router.post("/invite/complete", response_model=TokenResponse)
+def complete_invite(body: InviteCompleteRequest, request: Request, db: DbSession):
+    """
+    Complete invite flow: verify invite JWT, set password, activate user, mark invite used,
+    and issue normal login tokens.
+    """
+    payload = decode_invite_token(body.token)
+    if not payload:
+        raise HTTPException(status_code=400, detail="Invalid or expired invite token")
+
+    invite = db.execute(
+        select(UserInvite).where(
+            UserInvite.token == body.token,
+            UserInvite.revoked.is_(False),
+        )
+    ).scalars().one_or_none()
+    if not invite or invite.used_at is not None:
+        raise HTTPException(status_code=400, detail="Invalid or expired invite token")
+
+    user = db.get(User, invite.user_id)
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid invite token")
+
+    now = datetime.now(timezone.utc)
+    # Set password and activate account
+    user.password_hash = hash_password(body.new_password)
+    user.is_active = True
+    invite.used_at = now
+
+    # Optionally, mark other unused invites for this user as revoked
+    others = db.execute(
+        select(UserInvite).where(
+            UserInvite.user_id == user.id,
+            UserInvite.id != invite.id,
+            UserInvite.used_at.is_(None),
+            UserInvite.revoked.is_(False),
+        )
+    ).scalars().all()
+    for other in others:
+        other.revoked = True
+
+    db.commit()
+
+    # Issue normal login tokens so frontend can auto-sign-in
+    access_token = create_access_token(user.id)
+    raw_refresh, token_hash = create_refresh_token_pair(user.id)
+    payload = decode_token(raw_refresh)
+    expires_at = datetime.fromtimestamp(payload["exp"], tz=timezone.utc) if payload else None
+    if not expires_at:
+        raise HTTPException(status_code=500, detail="Token creation failed")
+
+    refresh_row = RefreshToken(
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=expires_at,
+        created_at=now,
+    )
+    db.add(refresh_row)
+    db.commit()
+
+    # Log invite completion as a login-like event
+    try:
+        client_host = request.client.host if request and request.client else None
+        log_activity(
+            db,
+            actor=user.name or user.email or "User",
+            event_action="InviteCompleted",
+            target_resource="Platform",
+            severity="info",
+            ip_address=client_host,
+            system="web",
+        )
+    except Exception:
+        pass
+
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=raw_refresh,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+    )
+

@@ -66,6 +66,43 @@ def decode_token(token: str) -> dict | None:
         return None
 
 
+def create_invite_token(
+    user_id: str,
+    email: str,
+    name: str,
+    expires_at: datetime,
+) -> str:
+    """Create a JWT for invite/set-password link. Payload: sub, email, name, exp (UTC timestamp)."""
+    exp_ts = int(expires_at.timestamp())
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "name": name,
+        "exp": exp_ts,
+        "type": "invite",
+    }
+    return jwt.encode(
+        payload,
+        settings.secret_key,
+        algorithm=settings.jwt_algorithm,
+    )
+
+
+def decode_invite_token(token: str) -> dict | None:
+    """Decode and verify invite JWT; return payload or None if invalid/expired."""
+    try:
+        payload = jwt.decode(
+            token,
+            settings.secret_key,
+            algorithms=[settings.jwt_algorithm],
+        )
+        if payload.get("type") != "invite":
+            return None
+        return payload
+    except jwt.PyJWTError:
+        return None
+
+
 def hash_refresh_token(raw_token: str) -> str:
     """Hash a refresh token string for storage/lookup."""
     return _token_hash(raw_token)

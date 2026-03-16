@@ -17,8 +17,22 @@ class UserLogin(BaseModel):
     remember: bool = False
 
 
+def _role_label_to_enum(label: str) -> UserRole:
+    """Map UI labels to UserRole: Super Admin -> admin, Admin -> manager, Developer -> analyst, Viewer -> viewer."""
+    s = (label or "").strip().lower()
+    if s in ("super admin", "superadmin"):
+        return UserRole.admin
+    if s == "admin":
+        return UserRole.manager
+    if s == "developer":
+        return UserRole.analyst
+    if s == "viewer":
+        return UserRole.viewer
+    raise ValueError("invalid role")
+
+
 class UserUpdate(BaseModel):
-    """Optional fields for PATCH /users/{user_id}. Only provided fields are updated."""
+    """Optional fields for PATCH /users/{user_id}. Only provided fields are updated. Role accepts enum value or UI label (Super Admin, Admin, Developer, Viewer)."""
     name: str | None = None
     email: EmailStr | None = None
     role: UserRole | None = None
@@ -31,11 +45,11 @@ class UserUpdate(BaseModel):
             return None
         if isinstance(v, UserRole):
             return v
-        s = str(v).lower().strip()
+        s = str(v).strip().lower()
         for r in UserRole:
             if r.value == s:
                 return r
-        raise ValueError("invalid role")
+        return _role_label_to_enum(str(v))
 
 
 class UserResponse(BaseModel):

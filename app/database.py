@@ -17,6 +17,8 @@ engine_kwargs = {
 if "mysql" in settings.database_url:
     engine_kwargs["pool_pre_ping"] = True  # test connection before use; replace if dead
     engine_kwargs["pool_recycle"] = 1800   # recycle connections after 30 min (RDS often closes idle after 8h)
+    # Use UTC for session so DATETIME/TIMESTAMP read/write is consistent with app (datetime.now(timezone.utc))
+    engine_kwargs["connect_args"] = {**connect_args, "init_command": "SET SESSION time_zone='+00:00'"}
 
 engine = create_engine(settings.database_url, **engine_kwargs)
 

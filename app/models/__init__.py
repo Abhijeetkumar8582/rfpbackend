@@ -13,6 +13,8 @@ from app.models.rfp_question import RFPQuestion
 from app.models.endpoint_log import EndpointLog
 from app.models.conversation_log import ConversationLog
 from app.models.faq import FAQ
+from app.models.document_access_log import DocumentAccessLog
+from app.models.user_invite import UserInvite
 
 __all__ = [
     "User",
@@ -30,4 +32,6 @@ __all__ = [
     "EndpointLog",
     "ConversationLog",
     "FAQ",
+    "DocumentAccessLog",
+    "UserInvite",
 ]

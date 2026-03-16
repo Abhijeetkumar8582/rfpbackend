@@ -26,6 +26,33 @@ async def lifespan(app: FastAPI):
     from sqlalchemy import select, text
 
     Base.metadata.create_all(bind=engine)
+    # One-time migration: document_access_logs id from integer to UUID (drop and recreate if old schema)
+    with engine.connect() as conn:
+        try:
+            dialect = engine.dialect.name
+            if dialect == "sqlite":
+                r = conn.execute(text("PRAGMA table_info(document_access_logs)")).fetchall()
+                # r is list of (cid, name, type, notnull, dflt_value, pk)
+                if r and any(col[1] == "id" and ("int" in (col[2] or "").lower()) for col in r):
+                    conn.execute(text("DROP TABLE document_access_logs"))
+                    conn.commit()
+                    Base.metadata.tables["document_access_logs"].create(engine)
+            elif dialect == "mysql":
+                r = conn.execute(text(
+                    "SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+                    "AND TABLE_NAME = 'document_access_logs' AND COLUMN_NAME = 'id'"
+                )).fetchone()
+                if r and r[0] and "int" in str(r[0]).lower():
+                    conn.execute(text("DROP TABLE document_access_logs"))
+                    conn.commit()
+                    Base.metadata.tables["document_access_logs"].create(engine)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "no such table" not in err_msg and "doesn't exist" not in err_msg and "1146" not in str(e):
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
     # Add missing columns to documents if DB was created from older schema (e.g. Unknown column 'cluster')
     if "mysql" in (settings.database_url or ""):
         with engine.connect() as conn:

@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter
 from sqlalchemy import select, func, delete
 
-from app.api.deps import DbSession
+from app.api.deps import DbSession, CurrentUserOptional, require_admin_or_manager
 from app.models.search_query import SearchQuery
 from app.models.project import Project
 from app.models.endpoint_log import EndpointLog
@@ -182,11 +182,12 @@ def get_knowledge_gaps(
 
 
 @router.post("/knowledge-gaps/validate-answers", response_model=ValidateFaqAnswersResponse)
-def validate_faq_answers(body: ValidateFaqAnswersRequest):
+def validate_faq_answers(body: ValidateFaqAnswersRequest, current_user: CurrentUserOptional):
     """
     Validate each question-answer pair: LLM rates 0-100 how well the answer addresses the question.
-    Returns confidence per search_query_id. Frontend uses this before showing Save validated answer.
+    Admin/Super Admin only. Returns confidence per search_query_id. Frontend uses this before showing Save validated answer.
     """
+    require_admin_or_manager(current_user)
     if not body.items:
         return ValidateFaqAnswersResponse(results=[])
     tuples_list = [
@@ -202,12 +203,13 @@ def validate_faq_answers(body: ValidateFaqAnswersRequest):
 
 
 @router.post("/knowledge-gaps/save-answers")
-def save_faq_answers(body: SaveFaqAnswersRequest, db: DbSession):
+def save_faq_answers(body: SaveFaqAnswersRequest, db: DbSession, current_user: CurrentUserOptional):
     """
     For each item with a non-empty answer: insert (question, answer) into FAQs with a new UUID,
-    then delete the corresponding row from search_queries. This moves answered gap questions
-    into the FAQs table and removes them from the gaps list.
+    then delete the corresponding row from search_queries. Admin/Super Admin only.
+    This moves answered gap questions into the FAQs table and removes them from the gaps list.
     """
+    require_admin_or_manager(current_user)
     saved = 0
     for item in body.items:
         answer_text = (item.answer or "").strip()

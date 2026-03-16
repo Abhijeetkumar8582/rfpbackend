@@ -150,20 +150,27 @@ class EndpointLogMiddleware(BaseHTTPMiddleware):
         response = await call_next(new_request)
         duration_ms = int((time.perf_counter() - start) * 1000)
 
-        # Capture response body and headers (replay body so client still receives it)
-        response_body_chunks = []
-        try:
-            async for chunk in response.body_iterator:
-                response_body_chunks.append(chunk)
-        except Exception:
-            pass
-        response_body_bytes = b"".join(response_body_chunks)
-        response_body_str = _body_for_log(response_body_bytes)
+        # Do not buffer streaming responses (e.g. SSE): pass through so client gets real-time stream
+        content_type = (response.headers.get("content-type") or "").lower()
+        is_streaming = "text/event-stream" in content_type or "application/stream" in content_type
 
-        async def replay_body():
-            for chunk in response_body_chunks:
-                yield chunk
-        response.body_iterator = replay_body()
+        if is_streaming:
+            response_body_str = "[streaming response]"
+        else:
+            # Capture response body and headers (replay body so client still receives it)
+            response_body_chunks = []
+            try:
+                async for chunk in response.body_iterator:
+                    response_body_chunks.append(chunk)
+            except Exception:
+                pass
+            response_body_bytes = b"".join(response_body_chunks)
+            response_body_str = _body_for_log(response_body_bytes)
+
+            async def replay_body():
+                for chunk in response_body_chunks:
+                    yield chunk
+            response.body_iterator = replay_body()
 
         response_headers_json = _response_headers_for_log(response.headers)
 
