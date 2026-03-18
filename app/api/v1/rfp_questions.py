@@ -1,3 +1,66 @@
+"""RFP Questions API — list and fetch RFPs from rfpquestions table."""
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, HTTPException
+from sqlalchemy import select, func
+
+from app.api.deps import DbSession
+from app.models.rfp_question import RFPQuestion
+from app.schemas.rfp_question import RFPQuestionResponse, RFPQuestionListResponse
+
+
+router = APIRouter(prefix="/rfp-questions", tags=["rfp-questions"])
+
+
+@router.get("", response_model=RFPQuestionListResponse)
+def list_rfp_questions(
+    db: DbSession,
+    skip: int = 0,
+    limit: int = 20,
+    user_id: str | None = None,
+    status: str | None = None,
+):
+    """
+    List RFP questions for a user with optional status filter.
+    Matches frontend query params: skip, limit, user_id, status.
+    """
+    base_q = select(RFPQuestion)
+    if user_id:
+        base_q = base_q.where(RFPQuestion.user_id == user_id)
+    if status and status not in ("", "all"):
+        base_q = base_q.where(RFPQuestion.status == status)
+
+    # Total count for pagination
+    total = db.execute(
+        select(func.count()).select_from(base_q.subquery())
+    ).scalar() or 0
+
+    rows = (
+        db.execute(
+            base_q.order_by(RFPQuestion.created_at.desc())
+            .offset(skip)
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    return RFPQuestionListResponse(items=list(rows), total=total)
+
+
+@router.get("/{rfpid}", response_model=RFPQuestionResponse)
+def get_rfp_question(rfpid: str, db: DbSession):
+    """Get a single RFP (questions + answers) by rfpid."""
+    row = (
+        db.execute(
+            select(RFPQuestion).where(RFPQuestion.rfpid == rfpid)
+        )
+        .scalars()
+        .one_or_none()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="RFP not found")
+    return row
+
 """RFP Questions API — import questions from Excel/CSV (column A) and store in rfpquestions table."""
 import csv
 import io

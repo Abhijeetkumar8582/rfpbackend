@@ -3,8 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import time
+import re
 from types import SimpleNamespace
 
 import httpx
@@ -13,16 +12,63 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# #region agent log
-def _debug_log(data: dict) -> None:
-    try:
-        log_path = os.path.join(os.getcwd(), "debug-697fbd.log")
-        payload = {"sessionId": "697fbd", "timestamp": int(time.time() * 1000), "location": "openai_client.py", "message": "GPT request", "data": data, "hypothesisId": "H1"}
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload) + "\n")
-    except Exception as e:
-        logger.warning("Debug log write failed: %s", e)
-# #endregion
+# ---------------------------------------------------------------------------
+# Model-specific request parameter handling
+# ---------------------------------------------------------------------------
+
+_MODEL_PROFILES: list[tuple[re.Pattern[str], dict]] = [
+    # Reasoning-style models often use max_completion_tokens and may reject temperature.
+    (re.compile(r"^(o1|o3)(-|$)", re.IGNORECASE), {"token_key": "max_completion_tokens", "supports_temperature": False}),
+    (re.compile(r"reasoning", re.IGNORECASE), {"token_key": "max_completion_tokens", "supports_temperature": False}),
+    # Default GPT-family chat models.
+    (re.compile(r"^gpt-", re.IGNORECASE), {"token_key": "max_tokens", "supports_temperature": True}),
+]
+
+
+def _model_profile(model: str | None) -> dict:
+    m = (model or "").strip()
+    if not m:
+        return {"token_key": "max_tokens", "supports_temperature": True}
+    for pat, prof in _MODEL_PROFILES:
+        if pat.search(m):
+            return prof
+    return {"token_key": "max_tokens", "supports_temperature": True}
+
+
+def _apply_model_params(body: dict, model: str | None, *, max_tokens: int | None, temperature: float | None) -> None:
+    prof = _model_profile(model)
+    token_key = prof.get("token_key") or "max_tokens"
+    supports_temperature = bool(prof.get("supports_temperature", True))
+
+    # Token parameter name varies by model families / gateways.
+    if max_tokens is not None:
+        body[token_key] = int(max_tokens)
+
+    # Some models/gateways reject temperature; omit if unsupported.
+    if temperature is not None and supports_temperature:
+        body["temperature"] = float(temperature)
+
+
+def build_chat_completions_body(
+    *,
+    model: str | None,
+    messages: list[dict],
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    response_format: dict | None = None,
+    send_model_in_body: bool = True,
+) -> dict:
+    """
+    Build an OpenAI-compatible chat-completions request body, applying model-specific
+    parameter differences (e.g. max_tokens vs max_completion_tokens, temperature support).
+    """
+    body: dict = {"messages": messages}
+    if model and send_model_in_body:
+        body["model"] = model
+    _apply_model_params(body, model, max_tokens=max_tokens, temperature=temperature)
+    if response_format is not None:
+        body["response_format"] = response_format
+    return body
 
 
 def _log_request(body: dict, url: str):
@@ -63,35 +109,20 @@ def _chat_completions_post(messages: list[dict], max_tokens: int = 1024, model: 
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    body = {
-        "messages": messages,
-        "max_tokens": max_tokens,
-    }
-    if model and getattr(settings, "openai_send_model_in_body", True):
-        body["model"] = model
-    if kwargs.get("response_format") and settings.openai_use_json_mode:
-        body["response_format"] = kwargs["response_format"]
+    body = build_chat_completions_body(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=kwargs.get("temperature"),
+        response_format=(kwargs.get("response_format") if settings.openai_use_json_mode else None),
+        send_model_in_body=bool(getattr(settings, "openai_send_model_in_body", True)),
+    )
 
     _log_request(body, url)
 
-    # #region agent log
-    try:
-        body_keys = list(body.keys())
-        body_json = json.dumps(body)
-        _debug_log({"body_keys": body_keys, "openai_use_json_mode": getattr(settings, "openai_use_json_mode", None), "has_response_format": "response_format" in body, "body_json_length": len(body_json), "body_sample": body_json[:2000]})
-    except Exception:
-        pass
-    # #endregion
-
-    with httpx.Client(timeout=60.0) as client:
+    timeout = float(kwargs.get("timeout", 60.0) or 60.0)
+    with httpx.Client(timeout=timeout) as client:
         r = client.post(url, json=body, headers=headers)
-
-    # #region agent log
-    try:
-        _debug_log({"response_status": r.status_code, "response_body_preview": r.text[:1500] if r.status_code >= 400 else None})
-    except Exception:
-        pass
-    # #endregion
 
     # Debug: print response status so 503 is visible in console
     print(f"DEBUG GPT RESPONSE: status={r.status_code}")

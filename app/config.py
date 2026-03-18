@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./rfp.db"
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
+    # Field encryption (for storing API credentials safely in DB)
+    # Recommended: 32-byte key, base64 encoded (optionally prefixed with "base64:").
+    # Example (generate): python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+    credentials_encryption_key: str = ""
+
     # OpenAI — chat completions (search answer, doc metadata, rephrase, categorize)
     openai_api_key: str = ""  # token for chat (e.g. Druid JWT)
     openai_base_url: str = ""  # chat completions URL, e.g. .../deployments/gpt-4o-mini/chat/completions?api-version=...

@@ -12,9 +12,7 @@ import json
 import logging
 import re
 
-import httpx
-
-from app.config import settings
+from app.services.openai_client import get_chat_client
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +57,7 @@ def answer_from_chunks(question: str, chunks: list[dict]) -> tuple[str, list[str
             empty_confidence,
         )
 
-    url = (settings.openai_base_url or "").strip()
-    token = (settings.openai_api_key or "").strip()
-    if not url or not token:
-        raise RuntimeError(
-            "OPENAI_BASE_URL and OPENAI_API_KEY are required for search answer. "
-            "Set them in backend/.env (e.g. Druid gateway URL and token)."
-        )
+    client, model = get_chat_client()
 
     context_parts = []
     total_len = 0
@@ -99,32 +91,21 @@ You must respond with valid JSON only, no other text. Use this exact structure:
     question_clean = _sanitize_text(question)
     user_content = f"""Relevant passages from the knowledge base:\n\n{context}\n\nQuestion: {question_clean}\n\nProduce an accurate, well-cited answer. Respond with JSON only."""
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": settings.openai_chat_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content[:_MAX_USER_CONTENT_CHARS]},
-        ],
-        "max_tokens": 8000,
-    }
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content[:_MAX_USER_CONTENT_CHARS]},
+            ],
+            max_tokens=8000,
+            timeout=60.0,
+        )
+    except Exception as e:
+        logger.error("GPT request failed: %s", e)
+        raise
 
-    with httpx.Client(timeout=60.0) as client:
-        r = client.post(url, json=body, headers=headers)
-
-    if r.status_code >= 400:
-        err_preview = (r.text or "")[:1500]
-        logger.error("GPT gateway returned %s: %s", r.status_code, err_preview)
-        raise RuntimeError(f"GPT gateway returned {r.status_code}: {err_preview}")
-    r.raise_for_status()
-
-    data = r.json()
-    choice = (data.get("choices") or [None])[0]
-    message = (choice.get("message") or {}).get("content") if choice else ""
-    raw_content = (message or "").strip()
+    raw_content = ((resp.choices[0].message.content or "") if resp and resp.choices else "").strip()
 
     # Parse JSON response: {"answer": "...", "topics_covered": [...], "confidence": {...}}
     answer = "I couldn't generate an answer from the retrieved passages."

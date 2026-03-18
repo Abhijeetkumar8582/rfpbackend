@@ -17,6 +17,84 @@ from app.database import engine
 from app.config import settings
 
 
+def run_create_api_credentials():
+    """Create api_credentials table for storing encrypted API credentials."""
+    url = settings.database_url
+
+    if "sqlite" in url:
+        # SQLite: no native JSON type; store JSON as TEXT.
+        # updated_at auto-update must be handled by app logic or triggers (not added here).
+        stmts = [
+            """
+            CREATE TABLE IF NOT EXISTS api_credentials (
+              id              VARCHAR(36) PRIMARY KEY,
+              tenant_id       VARCHAR(36) NOT NULL,
+              api_name        VARCHAR(255) NOT NULL,
+              api_url         VARCHAR(1000),
+              secret_key_1    TEXT,
+              secret_key_2    TEXT,
+              secret_key_3    TEXT,
+              secret_key_4    TEXT,
+              secret_key_5    TEXT,
+              parameter_json  TEXT,
+              status          VARCHAR(50) NOT NULL DEFAULT 'active',
+              created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_api_credentials_tenant ON api_credentials(tenant_id)",
+        ]
+    elif "mysql" in url:
+        stmts = [
+            """
+            CREATE TABLE IF NOT EXISTS api_credentials (
+              id              CHAR(36) PRIMARY KEY,
+              tenant_id       CHAR(36) NOT NULL,
+              api_name        VARCHAR(255) NOT NULL,
+              api_url         VARCHAR(1000) NULL,
+              secret_key_1    TEXT NULL,
+              secret_key_2    TEXT NULL,
+              secret_key_3    TEXT NULL,
+              secret_key_4    TEXT NULL,
+              secret_key_5    TEXT NULL,
+              parameter_json  JSON NULL,
+              status          VARCHAR(50) NOT NULL DEFAULT 'active',
+              created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              INDEX idx_api_credentials_tenant (tenant_id)
+            )
+            """,
+        ]
+    else:
+        # PostgreSQL: use JSONB + trigger-less updated_at default.
+        stmts = [
+            """
+            CREATE TABLE IF NOT EXISTS api_credentials (
+              id              VARCHAR(36) PRIMARY KEY,
+              tenant_id       VARCHAR(36) NOT NULL,
+              api_name        VARCHAR(255) NOT NULL,
+              api_url         VARCHAR(1000),
+              secret_key_1    TEXT,
+              secret_key_2    TEXT,
+              secret_key_3    TEXT,
+              secret_key_4    TEXT,
+              secret_key_5    TEXT,
+              parameter_json  JSONB,
+              status          VARCHAR(50) NOT NULL DEFAULT 'active',
+              created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_api_credentials_tenant ON api_credentials(tenant_id)",
+        ]
+
+    with engine.begin() as conn:
+        for s in stmts:
+            conn.execute(text(s))
+            preview = " ".join(s.split())
+            print(f"  OK: {preview[:60]}..." if len(preview) > 60 else f"  OK: {preview}")
+
+
 def run_search_queries_ts_to_datetime_drop_project_id():
     """Rename ts -> datetime and drop project_id on search_queries."""
     url = settings.database_url
@@ -90,6 +168,7 @@ def run_add_conversation_id():
 
 
 MIGRATIONS = {
+    "create_api_credentials": run_create_api_credentials,
     "search_queries_ts_to_datetime_drop_project_id": run_search_queries_ts_to_datetime_drop_project_id,
     "search_queries_drop_project_id_only": run_search_queries_drop_project_id_only,
     "add_conversation_id": run_add_conversation_id,

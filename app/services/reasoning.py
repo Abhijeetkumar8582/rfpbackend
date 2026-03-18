@@ -16,12 +16,11 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-import httpx
-
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.services.openai_client import get_chat_client
 
 logger = logging.getLogger(__name__)
 
@@ -40,36 +39,19 @@ def _sanitize_text(s: str) -> str:
 
 def _gpt_json(messages: list[dict], max_tokens: int = 2048) -> dict:
     """Call GPT and parse JSON response. Returns dict or empty dict on failure."""
-    url = (settings.openai_base_url or "").strip()
-    token = (settings.openai_api_key or "").strip()
-    if not url or not token:
-        raise RuntimeError("OPENAI_BASE_URL and OPENAI_API_KEY are required.")
-
-    body = {
-        "model": settings.openai_chat_model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-    }
-    if getattr(settings, "openai_send_model_in_body", True):
-        body["model"] = settings.openai_chat_model
-
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    with httpx.Client(timeout=90.0) as client:
-        r = client.post(url, json=body, headers=headers)
-
-    if r.status_code >= 400:
-        logger.error("GPT returned %s: %s", r.status_code, (r.text or "")[:500])
-        raise RuntimeError(f"GPT returned {r.status_code}: {r.text[:500]}")
-
-    data = r.json()
-    choice = (data.get("choices") or [None])[0]
-    content = (choice.get("message") or {}).get("content") if choice else ""
+    client, model = get_chat_client()
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        timeout=90.0,
+    )
+    content = ((resp.choices[0].message.content or "") if resp and resp.choices else "").strip()
 
     if not content:
         return {}
 
-    text = content.strip()
+    text = content
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if match:
         text = match.group(1).strip()
@@ -88,10 +70,7 @@ def validate_faq_answers(
     """
     if not items:
         return []
-    url = (settings.openai_base_url or "").strip()
-    token = (settings.openai_api_key or "").strip()
-    if not url or not token:
-        raise RuntimeError("OPENAI_BASE_URL and OPENAI_API_KEY are required.")
+    client, model = get_chat_client()
 
     parts = []
     for i, (sid, q, a) in enumerate(items, 1):
@@ -104,28 +83,16 @@ def validate_faq_answers(
     prompt += "\n\n".join(parts)
     prompt += "\n\nOutput format: {\"scores\": [n1, n2, ...]}"
 
-    body = {
-        "model": settings.openai_chat_model,
-        "messages": [
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
             {"role": "system", "content": "You output only valid JSON. No markdown, no explanation."},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 512,
-    }
-    if getattr(settings, "openai_send_model_in_body", True):
-        body["model"] = settings.openai_chat_model
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    with httpx.Client(timeout=60.0) as client:
-        r = client.post(url, json=body, headers=headers)
-
-    if r.status_code >= 400:
-        logger.error("FAQ validation GPT returned %s: %s", r.status_code, (r.text or "")[:500])
-        raise RuntimeError(f"Validation failed: {r.status_code}")
-
-    data = r.json()
-    choice = (data.get("choices") or [None])[0]
-    content = (choice.get("message") or {}).get("content") if choice else ""
+        max_tokens=512,
+        timeout=60.0,
+    )
+    content = ((resp.choices[0].message.content or "") if resp and resp.choices else "")
     text = (content or "").strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if match:
@@ -314,10 +281,7 @@ def reasoning_answer_from_chunks(
     Synthesize answer with citations, uncertainty note, and missing info note.
     Returns (answer, topics_covered, confidence, uncertainty_note, missing_info_note).
     """
-    url = (settings.openai_base_url or "").strip()
-    token = (settings.openai_api_key or "").strip()
-    if not url or not token:
-        raise RuntimeError("OPENAI_BASE_URL and OPENAI_API_KEY are required.")
+    client, model = get_chat_client()
 
     empty_topics: list[str] = []
     empty_conf = {"overall": 0.0, "evidence_coverage": 0.0, "contradiction_risk": 0.0}
@@ -380,25 +344,16 @@ Respond with valid JSON only. Use this exact structure:
             analysis_hint = f"\nQuery context: intent={intent}, domain={domain}\n"
 
     user_content = f"""Relevant passages:\n\n{context}\n\nQuestion: {_sanitize_text(question)}{analysis_hint}\n\nProduce a detailed, well-reasoned answer. Respond with JSON only."""
-
-    body = {
-        "model": settings.openai_chat_model,
-        "messages": [
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user_content[:_MAX_USER_CONTENT_CHARS]},
         ],
-        "max_tokens": 8000,
-    }
-
-    with httpx.Client(timeout=90.0) as client:
-        r = client.post(url, json=body, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
-
-    if r.status_code >= 400:
-        raise RuntimeError(f"GPT returned {r.status_code}: {r.text[:500]}")
-
-    data = r.json()
-    choice = (data.get("choices") or [None])[0]
-    raw = (choice.get("message") or {}).get("content") if choice else ""
+        max_tokens=8000,
+        timeout=90.0,
+    )
+    raw = ((resp.choices[0].message.content or "") if resp and resp.choices else "")
 
     answer = "I couldn't generate an answer from the retrieved passages."
     topics_covered = empty_topics
