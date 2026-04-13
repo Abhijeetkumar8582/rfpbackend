@@ -28,7 +28,12 @@ class RFPQuestion(Base):
     name: Mapped[str] = mapped_column(String(512), nullable=False, default="Untitled RFP")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # One conversation_id per Excel import — all bulk-generated answers use this for search_queries grouping
+    conversation_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     recipients: Mapped[str] = mapped_column(Text, nullable=False, default="[]")  # JSON array of recipient strings
+    # Comma-separated collaborator user IDs — those users see this RFP in My RFPs and may edit answers
+    # String not Text: MySQL disallows DEFAULT on TEXT columns; VARCHAR is fine for bounded id lists.
+    collaborator_user_ids: Mapped[str] = mapped_column(String(8192), nullable=False, default="")
     status: Mapped[str] = mapped_column(String(64), nullable=False, default="Draft")  # Draft, Sent, Viewed, etc.
     questions: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array of question strings
     answers: Mapped[str] = mapped_column(Text, nullable=False, default="[]")  # JSON array (initially empty)

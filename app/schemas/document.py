@@ -34,6 +34,7 @@ class DocumentResponse(BaseModel):
     deleted_at: datetime | None
     cluster: str | None = None
     storage_path: str = ""
+    s3_url: str | None = None
     doc_title: str | None = None
     doc_description: str | None = None
     doc_type: str | None = None

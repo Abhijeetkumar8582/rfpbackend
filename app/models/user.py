@@ -25,6 +25,8 @@ class User(Base):
     id: Mapped[str] = mapped_column(String(USER_ID_LENGTH), primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # Qdrant collection name for this user's personal vector store (provisioned via POST /users/me/vector-database)
+    vector_database: Mapped[str | None] = mapped_column(String(255), nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[UserRole] = mapped_column(Enum(UserRole), nullable=False, default=UserRole.viewer)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

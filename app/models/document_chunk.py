@@ -1,5 +1,6 @@
 """DocumentChunk model — stores split content as JSON array per document (one row per document)."""
 from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -24,7 +25,11 @@ class DocumentChunk(Base):
         index=True,
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array of chunk strings
-    embeddings_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON array of embedding arrays
+    # Many chunks × float JSON can exceed MySQL TEXT (~64KB); LONGTEXT on MySQL, Text elsewhere
+    embeddings_json: Mapped[str | None] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=True,
+    )
     chunk_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # GPT-generated metadata (same as documents table)
     doc_title: Mapped[str | None] = mapped_column(String(256), nullable=True)

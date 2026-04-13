@@ -1,11 +1,21 @@
 """SendGrid email service wrapper."""
 from __future__ import annotations
 
+import base64
 import logging
 from typing import Iterable
 
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Email as SGEmail, To
+from sendgrid.helpers.mail import (
+    Attachment,
+    Disposition,
+    FileContent,
+    FileName,
+    FileType,
+    Mail,
+    Email as SGEmail,
+    To,
+)
 
 from app.config import settings
 
@@ -18,6 +28,7 @@ def send_email(
     plain_content: str,
     html_content: str | None = None,
     reply_to: str | None = None,
+    attachments: list[tuple[bytes, str, str]] | None = None,
 ) -> bool:
     """
     Send an email via SendGrid.
@@ -49,6 +60,19 @@ def send_email(
 
     if reply_to:
         mail.reply_to = SGEmail(reply_to)
+
+    if attachments:
+        for content, filename, mime_type in attachments:
+            if not content:
+                continue
+            enc = base64.b64encode(content).decode("utf-8")
+            att = Attachment(
+                file_content=FileContent(enc),
+                file_name=FileName(filename),
+                file_type=FileType(mime_type),
+                disposition=Disposition("attachment"),
+            )
+            mail.add_attachment(att)
 
     try:
         sg = SendGridAPIClient(api_key=settings.sendgrid_api_key)

@@ -1,6 +1,7 @@
 """Project schemas."""
 from datetime import datetime
-from pydantic import BaseModel
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProjectCreate(BaseModel):
@@ -18,6 +19,8 @@ class ProjectUpdate(BaseModel):
 
 
 class ProjectResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     name: str
     description: str | None
@@ -25,21 +28,32 @@ class ProjectResponse(BaseModel):
     auto_delete_enabled: bool
     is_deleted: bool
     created_at: datetime
-
-    class Config:
-        from_attributes = True
+    # Per-project ingestion defaults (null chunk fields = use server env defaults on upload)
+    chunk_size_words: int | None = None
+    chunk_overlap_words: int | None = None
+    include_metadata_in_retrieval: bool = True
 
 
 class TrainDatasourceConfig(BaseModel):
-    """Optional config for training (chunk/embedding settings). Stored for future re-chunking; sync uses existing DB chunks."""
+    """
+    Optional fields update this project's saved defaults for **new uploads**.
+    Sync always rebuilds Qdrant from existing DB chunks (no re-embedding).
+    """
 
-    chunk_size_words: int | None = None
-    chunk_overlap_words: int | None = None
-    embedding_model: str | None = None
-    include_metadata: bool | None = None
+    model_config = ConfigDict(extra="ignore")
+
+    chunk_size_words: int | None = Field(None, ge=50, le=500)
+    chunk_overlap_words: int | None = Field(None, ge=0, le=120)
+    include_metadata: bool | None = Field(
+        None,
+        description="Persist preference for context enrichment; reserved for future RAG behavior.",
+    )
 
 
 class TrainDatasourceResponse(BaseModel):
     message: str
     documents_synced: int
     chunks_synced: int
+    chunk_size_words: int | None = None
+    chunk_overlap_words: int | None = None
+    include_metadata_in_retrieval: bool = True

@@ -1,7 +1,8 @@
-"""Search API — semantic search via ChromaDB (question embedding vs document embeddings)."""
+"""Search API — semantic search via Qdrant (question embedding vs stored chunk embeddings)."""
 import json
 import logging
 import os
+import re
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
@@ -27,6 +28,7 @@ from app.schemas.search import (
     ReasoningRequest,
     ReasoningResponse,
     QueryAnalysis,
+    SearchBalance,
     IntelligenceHubResponse,
     IntelligenceHubTopic,
     IntelligenceHubLowConfidence,
@@ -36,11 +38,12 @@ from app.schemas.search import (
     IndexHealth,
 )
 from app.services.embeddings import get_embedding
-from app.services.chroma import query_collection, query_collection_multi, get_collection_count
+from app.services.qdrant import query_collection, query_collection_multi, get_collection_count
 from app.services.search_answer import answer_from_chunks
 from app.services.query_intelligence import run_query_intelligence
 from app.services.reasoning import (
     analyze_and_rewrite_query,
+    apply_search_balance_fusion,
     bundle_evidence,
     rerank_chunks,
     reasoning_answer_from_chunks,
@@ -54,6 +57,40 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/search", tags=["search"])
+_MIN_CONFIDENCE_FOR_GPT = 0.50
+_QUERY_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in",
+    "is", "it", "many", "much", "of", "on", "or", "that", "the", "to", "what",
+    "when", "where", "which", "who", "why", "with", "your", "you", "my", "our",
+    "their", "this", "these", "those",
+}
+
+
+def _embedding_failure_detail(exc: BaseException) -> str:
+    err_msg = str(exc).strip() or type(exc).__name__
+    if "401" in err_msg or "invalid issuer" in err_msg.lower() or "authentication" in err_msg.lower():
+        return (
+            "Embedding service auth failed. If using a gateway (e.g. Druid), set OPENAI_BASE_URL "
+            "and ensure the token is valid for that gateway."
+        )
+    return f"Embedding failed: {err_msg}"
+
+
+def _qdrant_failure_detail(exc: BaseException) -> str:
+    err_msg = str(exc).strip() or type(exc).__name__
+    low = err_msg.lower()
+    hint = (
+        " Set QDRANT_LOCAL_PATH in .env for on-disk Qdrant (no server), or run Qdrant and match QDRANT_URL."
+    )
+    if "already accessed by another instance" in low or "alreadylocked" in low:
+        return (
+            f"Vector store lock conflict: {err_msg}. "
+            "Only one process can use embedded Qdrant path at a time. "
+            "Use a shared Qdrant server (QDRANT_URL) or run a single backend process."
+        )
+    if "10061" in err_msg or "connection refused" in low or "actively refused" in low:
+        return f"Vector store (Qdrant) unreachable: {err_msg}.{hint}"
+    return f"Vector store (Qdrant) failed: {err_msg}"
 
 
 def _compute_answer_status_and_reason(
@@ -226,7 +263,7 @@ def _save_search_query(
 
 
 def _resolve_conversation_id(db: DbSession, conversation_id_from_body: str | None) -> str:
-    """Return a valid conversation_id: reuse body's if still within 24h, else generate new."""
+    """Return a valid conversation_id: reuse body's if new thread or still within 24h, else generate new."""
     if not conversation_id_from_body or len(conversation_id_from_body) < 10:
         return generate_conversation_id()
     from sqlalchemy import func
@@ -234,9 +271,118 @@ def _resolve_conversation_id(db: DbSession, conversation_id_from_body: str | Non
         select(func.min(SearchQuery.datetime_)).where(SearchQuery.conversation_id == conversation_id_from_body)
     )
     first_ts = result.scalar()
+    if first_ts is None:
+        # First query in this conversation — keep client-supplied id (e.g. RFP Excel bulk, new chat).
+        return conversation_id_from_body
     if is_conversation_valid(first_ts):
         return conversation_id_from_body
     return generate_conversation_id()
+
+
+def _load_recent_conversation_history(
+    db: DbSession,
+    conversation_id: str,
+    *,
+    max_turns: int = 3,
+) -> list[dict]:
+    if not conversation_id:
+        return []
+    rows = db.execute(
+        select(SearchQuery)
+        .where(SearchQuery.conversation_id == conversation_id)
+        .order_by(SearchQuery.datetime_.desc())
+        .limit(max_turns)
+    ).scalars().all()
+    history: list[dict] = []
+    for r in reversed(rows):
+        q = (r.query_text or "").strip()
+        a = (r.answer or "").strip()
+        if q or a:
+            history.append({"query": q, "answer": a})
+    return history
+
+
+def _is_followup_query(query_text: str) -> bool:
+    q = (query_text or "").strip().lower()
+    if not q:
+        return False
+    terms = q.split()
+    if len(terms) <= 6:
+        return True
+    follow_markers = (
+        "it", "that", "those", "these", "they", "them",
+        "this", "same", "also", "and what", "how many are",
+        "what about", "how about", "now",
+    )
+    return any(marker in q for marker in follow_markers)
+
+
+def _build_contextual_query(query_text: str, history: list[dict]) -> str:
+    """
+    Make follow-up questions standalone for better retrieval.
+    """
+    if not history or not _is_followup_query(query_text):
+        return query_text
+    last = history[-1]
+    last_q = (last.get("query") or "").strip()
+    last_a = (last.get("answer") or "").strip()
+    context = f"Previous question: {last_q[:220]}"
+    if last_a:
+        context += f". Previous answer summary: {last_a[:280]}"
+    return f"{query_text}. Context: {context}"
+
+
+def _split_compound_query(query_text: str, *, max_parts: int = 4) -> list[str]:
+    """
+    Split compound questions like "A and B", "A or B", "A & B" into sub-questions.
+    """
+    text = " ".join((query_text or "").strip().split())
+    if not text:
+        return []
+    raw_parts = re.split(r"\s+(?:and|or|&)\s+", text, flags=re.IGNORECASE)
+    if len(raw_parts) <= 1:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in raw_parts:
+        p = part.strip(" \t\r\n,.;:")
+        if len(p) < 4:
+            continue
+        low = p.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(p)
+        if len(out) >= max_parts:
+            break
+    return out if len(out) >= 2 else []
+
+
+def _merge_query_variants(primary: list[str], secondary: list[str], *, max_items: int = 6) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for q in list(primary) + list(secondary):
+        s = (q or "").strip()
+        if not s:
+            continue
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(s)
+        if len(merged) >= max_items:
+            break
+    return merged
+
+
+def _build_synthesis_question(query_text: str, sub_questions: list[str]) -> str:
+    if not sub_questions:
+        return query_text
+    lines = "\n".join(f"{i+1}. {q}" for i, q in enumerate(sub_questions))
+    return (
+        f"{query_text}\n\nSub-questions to answer and merge:\n{lines}\n"
+        "Return one combined answer that covers all sub-questions."
+    )
 
 
 def _compute_answer_status_and_reason(
@@ -310,6 +456,55 @@ def _compute_answer_status_and_reason(
     return status, reason
 
 
+def _opt_positive_int(val: object) -> int | None:
+    if val is None:
+        return None
+    try:
+        n = int(val)
+        return n if n > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _document_source_open_url(doc: Document | None, page: int | None) -> str | None:
+    """Public URL to open the stored file; skips local-only storage. Appends #page=N for PDF deep links."""
+    if not doc or not doc.storage_path:
+        return None
+    if doc.storage_path.startswith("local/"):
+        return None
+    frag = f"#page={page}" if page and page > 0 else ""
+    if getattr(doc, "s3_url", None):
+        return f"{doc.s3_url}{frag}"
+    base = settings.backend_public_url.rstrip("/")
+    return f"{base}{settings.api_v1_prefix}/documents/{doc.id}/download{frag}"
+
+
+def _enrich_results_source_urls(
+    db: DbSession,
+    project_id: str,
+    results: list[SearchResultItem],
+) -> list[SearchResultItem]:
+    if not results:
+        return results
+    ids = list({r.document_id for r in results if r.document_id})
+    if not ids:
+        return results
+    rows = db.execute(
+        select(Document).where(
+            Document.project_id == project_id,
+            Document.id.in_(ids),
+        )
+    ).scalars().all()
+    by_id = {d.id: d for d in rows}
+    enriched: list[SearchResultItem] = []
+    for r in results:
+        doc = by_id.get(r.document_id)
+        page = r.page_start if r.page_start and r.page_start > 0 else None
+        url = _document_source_open_url(doc, page)
+        enriched.append(r.model_copy(update={"source_url": url}))
+    return enriched
+
+
 def _build_sources(
     results: list[SearchResultItem],
     chroma_ids: list[str],
@@ -331,14 +526,325 @@ def _build_sources(
                 title=title,
                 filename=r.filename or "",
                 chunk_id=chunk_id,
-                page_start=None,
-                page_end=None,
-                section=None,
+                page_start=r.page_start,
+                page_end=r.page_end,
+                section=r.section,
                 snippet=snippet,
                 score=round(r.score, 2),
+                source_url=r.source_url,
             )
         )
     return sources
+
+
+def _extract_query_terms(query_text: str) -> list[str]:
+    parts = re.split(r"[^a-z0-9]+", (query_text or "").lower())
+    terms: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if len(part) < 3 or part in _QUERY_STOPWORDS or part in seen:
+            continue
+        seen.add(part)
+        terms.append(part)
+    return terms
+
+
+def _metadata_corpus_for_doc(doc: Document | None, fallback_filename: str) -> str:
+    if not doc:
+        return (fallback_filename or "").lower()
+    chunks: list[str] = [
+        doc.filename or "",
+        doc.doc_title or "",
+        doc.doc_description or "",
+        doc.doc_type or "",
+        doc.cluster or "",
+    ]
+    if doc.tags_json:
+        try:
+            parsed = json.loads(doc.tags_json) if isinstance(doc.tags_json, str) else doc.tags_json
+            if isinstance(parsed, list):
+                chunks.extend(str(x) for x in parsed if x)
+            elif isinstance(parsed, dict):
+                chunks.extend(str(x) for x in parsed.values() if x)
+        except Exception:
+            pass
+    return " ".join(chunks).lower()
+
+
+def _content_overlap_score(query_terms: list[str], content: str) -> float:
+    if not query_terms:
+        return 0.0
+    body = (content or "").lower()
+    if not body:
+        return 0.0
+    hits = sum(1 for term in query_terms if term in body)
+    return min(1.0, hits / max(1, len(query_terms)))
+
+
+def _filter_results_by_confidence(
+    results: list[SearchResultItem],
+    *,
+    min_score_exclusive: float = _MIN_CONFIDENCE_FOR_GPT,
+) -> list[SearchResultItem]:
+    return [r for r in results if float(r.score or 0.0) > min_score_exclusive]
+
+
+def _filter_chunk_dicts_by_confidence(
+    chunk_dicts: list[dict],
+    *,
+    min_score_exclusive: float = _MIN_CONFIDENCE_FOR_GPT,
+) -> list[dict]:
+    return [c for c in chunk_dicts if float(c.get("score") or 0.0) > min_score_exclusive]
+
+
+def _rerank_results_by_metadata(
+    db: DbSession,
+    project_id: str,
+    query_text: str,
+    results: list[SearchResultItem],
+    chunk_dicts: list[dict] | None = None,
+) -> tuple[list[SearchResultItem], list[dict] | None]:
+    if not results:
+        return results, chunk_dicts
+
+    query_terms = _extract_query_terms(query_text)
+    if not query_terms:
+        return results, chunk_dicts
+
+    doc_ids = list({r.document_id for r in results if r.document_id})
+    if not doc_ids:
+        return results, chunk_dicts
+
+    docs = db.execute(
+        select(Document).where(
+            Document.project_id == project_id,
+            Document.id.in_(doc_ids),
+        )
+    ).scalars().all()
+    by_id = {d.id: d for d in docs}
+
+    ranked_rows: list[tuple[float, float, float, int]] = []
+    for idx, r in enumerate(results):
+        metadata_text = _metadata_corpus_for_doc(by_id.get(r.document_id), r.filename)
+        metadata_hits = sum(1 for term in query_terms if term in metadata_text)
+        metadata_score = min(1.0, metadata_hits / max(1, len(query_terms)))
+        lexical_score = _content_overlap_score(query_terms, r.content[:1200])
+        vector_score = max(0.0, min(1.0, float(r.score or 0.0)))
+        # Metadata is primary, lexical second, vector score as tie-breaker.
+        combined = (0.70 * metadata_score) + (0.20 * lexical_score) + (0.10 * vector_score)
+        ranked_rows.append((combined, metadata_score, vector_score, idx))
+
+    ranked_rows.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    ordered_results = [results[idx] for _, _, _, idx in ranked_rows]
+    for i, (combined, _, _, _) in enumerate(ranked_rows):
+        ordered_results[i].score = round(combined, 4)
+
+    ordered_chunks: list[dict] | None = None
+    if chunk_dicts is not None and len(chunk_dicts) == len(results):
+        ordered_chunks = [chunk_dicts[idx] for _, _, _, idx in ranked_rows]
+        for i, (combined, _, _, _) in enumerate(ranked_rows):
+            ordered_chunks[i]["score"] = round(combined, 4)
+
+    return ordered_results, ordered_chunks
+
+
+def _select_metadata_candidate_doc_ids(
+    db: DbSession,
+    project_id: str,
+    query_text: str,
+    *,
+    limit: int = 6,
+) -> list[str]:
+    terms = _extract_query_terms(query_text)
+    if not terms:
+        return []
+    docs = db.execute(
+        select(Document).where(
+            Document.project_id == project_id,
+            Document.deleted_at.is_(None),
+        )
+    ).scalars().all()
+    scored: list[tuple[float, str]] = []
+    for d in docs:
+        corpus = _metadata_corpus_for_doc(d, d.filename or "")
+        if not corpus:
+            continue
+        hits = sum(1 for t in terms if t in corpus)
+        if hits <= 0:
+            continue
+        score = hits / max(1, len(terms))
+        scored.append((score, d.id))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [doc_id for _, doc_id in scored[:limit]]
+
+
+def _run_qdrant_retrieval(
+    *,
+    project_id: str,
+    queries: list[str],
+    n_results: int,
+    document_ids: list[str] | None = None,
+    payload_filters: dict | None = None,
+) -> dict:
+    if len(queries) == 1:
+        emb = get_embedding(queries[0])
+        return query_collection(
+            project_id=project_id,
+            query_embedding=emb,
+            n_results=n_results,
+            document_ids=document_ids,
+            query_text=queries[0],
+            payload_filters=payload_filters,
+        )
+    query_embeddings = [get_embedding(q) for q in queries]
+    return query_collection_multi(
+        project_id=project_id,
+        query_embeddings=query_embeddings,
+        query_texts=queries,
+        n_results_per_query=max(5, n_results // max(1, len(query_embeddings))),
+        total_results=n_results,
+        document_ids=document_ids,
+        payload_filters=payload_filters,
+    )
+
+
+def _raw_to_hits(raw: dict) -> tuple[list[SearchResultItem], list[dict]]:
+    ids = (raw.get("ids") or [[]])[0]
+    documents = (raw.get("documents") or [[]])[0]
+    metadatas = (raw.get("metadatas") or [[]])[0]
+    distances = (raw.get("distances") or [[]])[0]
+    results: list[SearchResultItem] = []
+    chunk_dicts: list[dict] = []
+    for i in range(len(ids)):
+        meta = metadatas[i] if i < len(metadatas) else {}
+        doc_id = meta.get("document_id")
+        if doc_id is None:
+            continue
+        chunk_idx = int(meta.get("chunk_index", 0))
+        filename = meta.get("filename") or ""
+        content = documents[i] if i < len(documents) else ""
+        dist = float(distances[i]) if i < len(distances) else 0.0
+        score = 1.0 / (1.0 + dist) if dist is not None else 0.0
+        pg_s = _opt_positive_int(meta.get("page_start"))
+        pg_e = _opt_positive_int(meta.get("page_end"))
+        item = SearchResultItem(
+            content=content,
+            document_id=str(doc_id),
+            filename=filename,
+            chunk_index=chunk_idx,
+            section=meta.get("section") or None,
+            breadcrumb=meta.get("breadcrumb") or None,
+            page_start=pg_s,
+            page_end=pg_e,
+            source_url=None,
+            distance=dist,
+            score=round(score, 4),
+        )
+        results.append(item)
+        chunk_dicts.append({
+            "chunk_id": str(ids[i]),
+            "content": content,
+            "filename": filename,
+            "score": score,
+            "document_id": str(doc_id),
+            "chunk_index": chunk_idx,
+            "section": meta.get("section") or "",
+            "breadcrumb": meta.get("breadcrumb") or "",
+            "distance": dist,
+            "page_start": pg_s,
+            "page_end": pg_e,
+        })
+    return results, chunk_dicts
+
+
+def _merge_hits(
+    primary: tuple[list[SearchResultItem], list[dict]],
+    secondary: tuple[list[SearchResultItem], list[dict]],
+    *,
+    max_items: int,
+) -> tuple[list[SearchResultItem], list[dict]]:
+    p_results, p_chunks = primary
+    s_results, s_chunks = secondary
+    merged_results: list[SearchResultItem] = []
+    merged_chunks: list[dict] = []
+    seen: set[str] = set()
+
+    for r, c in list(zip(p_results, p_chunks)) + list(zip(s_results, s_chunks)):
+        key = str(c.get("chunk_id") or f"{r.document_id}:{r.chunk_index}")
+        if key in seen:
+            continue
+        seen.add(key)
+        merged_results.append(r)
+        merged_chunks.append(c)
+        if len(merged_results) >= max_items:
+            break
+    return merged_results, merged_chunks
+
+
+def _retrieve_with_metadata_first(
+    *,
+    db: DbSession,
+    project_id: str,
+    query_text: str,
+    queries: list[str],
+    n_results: int,
+    payload_filters: dict | None = None,
+) -> tuple[list[SearchResultItem], list[dict]]:
+    candidate_doc_ids = _select_metadata_candidate_doc_ids(db, project_id, query_text)
+    scoped_hits: tuple[list[SearchResultItem], list[dict]] = ([], [])
+    if candidate_doc_ids:
+        scoped_raw = _run_qdrant_retrieval(
+            project_id=project_id,
+            queries=queries,
+            n_results=max(8, n_results),
+            document_ids=candidate_doc_ids,
+            payload_filters=payload_filters,
+        )
+        scoped_hits = _raw_to_hits(scoped_raw)
+
+    scoped_results, _ = scoped_hits
+    scoped_top3_avg = (
+        sum(float(r.score or 0.0) for r in scoped_results[:3]) / min(3, len(scoped_results))
+        if scoped_results
+        else 0.0
+    )
+    scoped_good = len(scoped_results) >= 3 and scoped_top3_avg >= 0.55
+    if scoped_good and len(scoped_results) >= n_results:
+        return scoped_hits
+
+    global_raw = _run_qdrant_retrieval(
+        project_id=project_id,
+        queries=queries,
+        n_results=max(10, n_results),
+        payload_filters=payload_filters,
+    )
+    global_hits = _raw_to_hits(global_raw)
+    if not scoped_results:
+        return global_hits
+    return _merge_hits(scoped_hits, global_hits, max_items=max(10, n_results))
+
+
+def _finalize_chunks_for_answer(
+    query_text: str,
+    chunk_dicts: list[dict],
+    *,
+    search_balance: SearchBalance | None,
+    top_k: int,
+) -> list[dict]:
+    """
+    Cross-encoder rerank only (legacy), or weighted fusion of keyword / vector / rerank when
+    search_balance is set (matches Search balance UI).
+    """
+    if search_balance is None:
+        return rerank_chunks(query_text, chunk_dicts, top_k=top_k)
+    return apply_search_balance_fusion(
+        query_text,
+        chunk_dicts,
+        text_pct=search_balance.text_pct,
+        vector_pct=search_balance.vector_pct,
+        rerank_pct=search_balance.rerank_pct,
+        top_k=top_k,
+    )
 
 
 def _compute_answer_status_and_reason(
@@ -407,7 +913,7 @@ def _compute_answer_status_and_reason(
 @router.post("/query", response_model=SearchResponse)
 def search(body: SearchRequest, db: DbSession, current_user: CurrentUser):
     """
-    Embed the question, search ChromaDB for the project's collection,
+    Embed the question, search Qdrant for the project's collection,
     return top-k chunks by similarity (question embedding vs stored chunk embeddings).
     Saves the search to search_queries table.
     When advanced_search=True, runs Query Intelligence Layer first (cleanup, intent, split, rewrite, domain, filters, clarification, plan).
@@ -423,6 +929,9 @@ def search(body: SearchRequest, db: DbSession, current_user: CurrentUser):
     clarification_questions: list[str] = []
     filters_json = body.filters_json
     queries = [query_text]
+    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
+    conversation_history = _load_recent_conversation_history(db, conv_id)
+    sub_questions: list[str] = []
 
     if body.advanced_search:
         try:
@@ -442,63 +951,44 @@ def search(body: SearchRequest, db: DbSession, current_user: CurrentUser):
                     filters_json = {**filters_json, **f}
         except Exception as e:
             logger.warning("Query intelligence failed, using raw query: %s", e)
+        sub_questions = _split_compound_query(query_text)
+        contextual_subs = [_build_contextual_query(sq, conversation_history) for sq in sub_questions]
+        queries = _merge_query_variants(contextual_subs, queries, max_items=6)
 
+    retrieval_query = _build_contextual_query(query_text, conversation_history)
+    if len(queries) == 1:
+        queries = [retrieval_query]
+    elif retrieval_query != query_text:
+        queries = [retrieval_query] + [q for q in queries if q != retrieval_query][:5]
+
+    effective_k = max(int(body.k or 0), 10)
     try:
-        if len(queries) == 1:
-            query_embedding = get_embedding(queries[0])
-            raw = query_collection(
-                project_id=body.project_id,
-                query_embedding=query_embedding,
-                n_results=body.k,
-            )
-        else:
-            query_embeddings = [get_embedding(q) for q in queries]
-            raw = query_collection_multi(
-                project_id=body.project_id,
-                query_embeddings=query_embeddings,
-                n_results_per_query=max(5, body.k // len(query_embeddings)),
-                total_results=body.k,
-            )
+        results, _ = _retrieve_with_metadata_first(
+            db=db,
+            project_id=body.project_id,
+            query_text=query_text,
+            queries=queries,
+            n_results=effective_k,
+            payload_filters=filters_json,
+        )
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=_embedding_failure_detail(e))
 
-    # Chroma returns lists of lists (one per query); we use first row
-    ids = (raw.get("ids") or [[]])[0]
-    documents = (raw.get("documents") or [[]])[0]
-    metadatas = (raw.get("metadatas") or [[]])[0]
-    distances = (raw.get("distances") or [[]])[0]
+    results, _ = _rerank_results_by_metadata(db, body.project_id, query_text, results)
 
-    results: list[SearchResultItem] = []
-    for i in range(len(ids)):
-        meta = metadatas[i] if i < len(metadatas) else {}
-        doc_id = meta.get("document_id")
-        chunk_idx = meta.get("chunk_index", 0)
-        filename = meta.get("filename") or ""
-        content = documents[i] if i < len(documents) else ""
-        dist = float(distances[i]) if i < len(distances) else 0.0
-        # ChromaDB L2 distance: lower = more similar. Convert to score in [0,1]: 1 / (1 + distance)
-        score = 1.0 / (1.0 + dist) if dist is not None else 0.0
-        if doc_id is not None:
-            results.append(
-                SearchResultItem(
-                    content=content,
-                    document_id=str(doc_id),
-                    filename=filename,
-                    chunk_index=int(chunk_idx),
-                    distance=dist,
-                    score=round(score, 4),
-                )
-            )
+    results = _filter_results_by_confidence(results)
+    results = _enrich_results_source_urls(db, body.project_id, results)
 
     latency_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
-    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
     try:
         _save_search_query(
             db,
             actor_user_id=current_user.id,
             conversation_id=conv_id,
             query_text=query_text,
-            k=body.k,
+            k=effective_k,
             results_count=len(results),
             latency_ms=latency_ms,
             filters_json=filters_json,
@@ -514,7 +1004,7 @@ def search(body: SearchRequest, db: DbSession, current_user: CurrentUser):
     return SearchResponse(
         query_text=query_text,
         project_id=body.project_id,
-        k=body.k,
+        k=effective_k,
         results=results,
         advanced_search_used=advanced_search_used,
         cleaned_query=cleaned_query,
@@ -526,7 +1016,7 @@ def search(body: SearchRequest, db: DbSession, current_user: CurrentUser):
 @router.post("/answer", response_model=SearchAnswerResponse)
 def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUser):
     """
-    ChromaDB semantic search → rerank with cross-encoder → GPT synthesis.
+    Qdrant semantic search → rerank with cross-encoder → GPT synthesis.
     Retrieve more chunks, rerank for accuracy, then synthesize.
     Saves the search to search_queries table.
     When advanced_search=True, runs Query Intelligence Layer first (cleanup, intent, split, rewrite, etc.).
@@ -548,6 +1038,9 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUser)
     clarification_questions: list[str] = []
     filters_json = body.filters_json
     queries = [query_text]
+    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
+    conversation_history = _load_recent_conversation_history(db, conv_id)
+    sub_questions: list[str] = []
 
     if body.advanced_search:
         try:
@@ -567,72 +1060,39 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUser)
                     filters_json = {**filters_json, **f}
         except Exception as e:
             logger.warning("Query intelligence failed, using raw query: %s", e)
+        sub_questions = _split_compound_query(query_text)
 
+    retrieval_query = _build_contextual_query(query_text, conversation_history)
+    if len(queries) == 1:
+        queries = [retrieval_query]
+    elif retrieval_query != query_text:
+        queries = [retrieval_query] + [q for q in queries if q != retrieval_query][:5]
+
+    retrieve_k = min(max(body.k * 2, 15), 25)
     try:
-        if len(queries) == 1:
-            query_embedding = get_embedding(queries[0])
-            retrieve_k = min(max(body.k * 2, 15), 25)
-            raw = query_collection(
-                project_id=body.project_id,
-                query_embedding=query_embedding,
-                n_results=retrieve_k,
-            )
-        else:
-            query_embeddings = [get_embedding(q) for q in queries]
-            retrieve_k = min(max(body.k * 2, 15), 25)
-            raw = query_collection_multi(
-                project_id=body.project_id,
-                query_embeddings=query_embeddings,
-                n_results_per_query=max(5, retrieve_k // len(query_embeddings)),
-                total_results=retrieve_k,
-            )
+        results, chunk_dicts = _retrieve_with_metadata_first(
+            db=db,
+            project_id=body.project_id,
+            query_text=query_text,
+            queries=queries,
+            n_results=retrieve_k,
+            payload_filters=filters_json,
+        )
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
-        err_msg = str(e).strip() or type(e).__name__
-        if "401" in err_msg or "invalid issuer" in err_msg.lower() or "authentication" in err_msg.lower():
-            raise HTTPException(
-                status_code=503,
-                detail="Embedding service auth failed. If using a gateway (e.g. Druid), set OPENAI_BASE_URL and ensure the token is valid for that gateway.",
-            )
-        raise HTTPException(status_code=503, detail=f"Embedding failed: {err_msg}")
+        raise HTTPException(status_code=503, detail=_embedding_failure_detail(e))
 
-    ids = (raw.get("ids") or [[]])[0]
-    documents = (raw.get("documents") or [[]])[0]
-    metadatas = (raw.get("metadatas") or [[]])[0]
-    distances = (raw.get("distances") or [[]])[0]
+    results, reranked_chunks = _rerank_results_by_metadata(
+        db, body.project_id, query_text, results, chunk_dicts
+    )
+    if reranked_chunks is not None:
+        chunk_dicts = reranked_chunks
 
-    results: list[SearchResultItem] = []
-    chunk_dicts: list[dict] = []
-    for i in range(len(ids)):
-        meta = metadatas[i] if i < len(metadatas) else {}
-        doc_id = meta.get("document_id")
-        chunk_idx = meta.get("chunk_index", 0)
-        filename = meta.get("filename") or ""
-        content = documents[i] if i < len(documents) else ""
-        dist = float(distances[i]) if i < len(distances) else 0.0
-        score = 1.0 / (1.0 + dist) if dist is not None else 0.0
-        if doc_id is not None:
-            item = SearchResultItem(
-                content=content,
-                document_id=str(doc_id),
-                filename=filename,
-                chunk_index=int(chunk_idx),
-                distance=dist,
-                score=round(score, 4),
-            )
-            results.append(item)
-            chunk_dicts.append({
-                "content": content,
-                "filename": filename,
-                "score": score,
-                "document_id": str(doc_id),
-                "chunk_index": int(chunk_idx),
-                "distance": dist,
-            })
-
-    # Rerank with cross-encoder for more accurate relevance ordering
-    reranked = rerank_chunks(query_text, chunk_dicts, top_k=body.k)
+    # Rerank or fuse (Search balance UI: text / vector / rerank weights)
+    reranked = _finalize_chunks_for_answer(
+        query_text, chunk_dicts, search_balance=body.search_balance, top_k=body.k
+    )
     if reranked:
         chunk_dicts = reranked
         results = [
@@ -641,18 +1101,30 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUser)
                 document_id=str(c.get("document_id", "")),
                 filename=c.get("filename", ""),
                 chunk_index=int(c.get("chunk_index", 0)),
+                section=(c.get("section") or None),
+                breadcrumb=(c.get("breadcrumb") or None),
+                page_start=_opt_positive_int(c.get("page_start")),
+                page_end=_opt_positive_int(c.get("page_end")),
+                source_url=None,
                 distance=c.get("distance", 0.0),
                 score=round(c.get("score", 0.0), 4),
             )
             for c in chunk_dicts
         ]
 
+    chunk_dicts = _filter_chunk_dicts_by_confidence(chunk_dicts)
+    results = _filter_results_by_confidence(results)
+    results = _enrich_results_source_urls(db, body.project_id, results)
+
     chunks_for_gpt = [
         {"content": c.get("content"), "filename": c.get("filename"), "score": c.get("score")}
         for c in chunk_dicts
     ]
     try:
-        answer, topics_covered, gpt_confidence = answer_from_chunks(query_text, chunks_for_gpt)
+        synthesis_question = _build_synthesis_question(query_text, sub_questions)
+        answer, topics_covered, gpt_confidence = answer_from_chunks(
+            synthesis_question, chunks_for_gpt, conversation_history=conversation_history
+        )
     except Exception as e:
         print(f"[DEBUG] /search/answer GPT call failed: {type(e).__name__}: {e}")
         logger.exception("GPT search answer failed: %s", e)
@@ -689,7 +1161,6 @@ def search_answer(body: SearchRequest, db: DbSession, current_user: CurrentUser)
     latency_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
     search_query_id: int | None = None
     conversation_id_out: str | None = None
-    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
     try:
         sq_row = _save_search_query(
             db,
@@ -769,50 +1240,24 @@ def search_chat(body: SearchChatRequest, db: DbSession, current_user: CurrentUse
 
     t0 = datetime.now(timezone.utc)
 
+    effective_k = max(int(body.k or 0), 10)
     try:
-        query_embedding = get_embedding(query_text)
+        results, _ = _retrieve_with_metadata_first(
+            db=db,
+            project_id=body.project_id,
+            query_text=query_text,
+            queries=[query_text],
+            n_results=effective_k,
+            payload_filters=body.filters_json,
+        )
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
-        err_msg = str(e).strip() or type(e).__name__
-        if "401" in err_msg or "invalid issuer" in err_msg.lower() or "authentication" in err_msg.lower():
-            raise HTTPException(
-                status_code=503,
-                detail="Embedding service auth failed. If using a gateway (e.g. Druid), set OPENAI_BASE_URL and ensure the token is valid for that gateway.",
-            )
-        raise HTTPException(status_code=503, detail=f"Embedding failed: {err_msg}")
+        raise HTTPException(status_code=503, detail=_embedding_failure_detail(e))
+    results, _ = _rerank_results_by_metadata(db, body.project_id, query_text, results)
 
-    raw = query_collection(
-        project_id=body.project_id,
-        query_embedding=query_embedding,
-        n_results=body.k,
-    )
-
-    ids = (raw.get("ids") or [[]])[0]
-    documents = (raw.get("documents") or [[]])[0]
-    metadatas = (raw.get("metadatas") or [[]])[0]
-    distances = (raw.get("distances") or [[]])[0]
-
-    results: list[SearchResultItem] = []
-    for i in range(len(ids)):
-        meta = metadatas[i] if i < len(metadatas) else {}
-        doc_id = meta.get("document_id")
-        chunk_idx = meta.get("chunk_index", 0)
-        filename = meta.get("filename") or ""
-        content = documents[i] if i < len(documents) else ""
-        dist = float(distances[i]) if i < len(distances) else 0.0
-        score = 1.0 / (1.0 + dist) if dist is not None else 0.0
-        if doc_id is not None:
-            results.append(
-                SearchResultItem(
-                    content=content,
-                    document_id=str(doc_id),
-                    filename=filename,
-                    chunk_index=int(chunk_idx),
-                    distance=dist,
-                    score=round(score, 4),
-                )
-            )
+    results = _filter_results_by_confidence(results)
+    results = _enrich_results_source_urls(db, body.project_id, results)
 
     chunks_for_gpt = [
         {"content": r.content, "filename": r.filename, "score": r.score}
@@ -831,8 +1276,8 @@ def search_chat(body: SearchChatRequest, db: DbSession, current_user: CurrentUse
         raise HTTPException(status_code=503, detail=f"GPT answer failed: {err_msg}")
 
     topic_for_db = ", ".join(topics_covered)[:64] if topics_covered else None
-    ids = (raw.get("ids") or [[]])[0]
-    sources = _build_sources(results, ids)
+    ids_for_sources = [f"doc_{r.document_id}_chunk_{r.chunk_index}" for r in results]
+    sources = _build_sources(results, ids_for_sources)
     retrieval_avg_top3 = (
         sum(r.score for r in results[:3]) / min(3, len(results)) if results else 0.0
     )
@@ -860,7 +1305,7 @@ def search_chat(body: SearchChatRequest, db: DbSession, current_user: CurrentUse
             actor_user_id=current_user.id,
             conversation_id=conv_id,
             query_text=query_text,
-            k=body.k,
+            k=effective_k,
             results_count=len(results),
             latency_ms=latency_ms,
             filters_json=body.filters_json,
@@ -920,6 +1365,9 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
     intelligence_clarification_questions: list[str] = []
     query_analysis: dict = {}
     search_queries: list[str] = [query_text]
+    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
+    conversation_history = _load_recent_conversation_history(db, conv_id)
+    sub_questions: list[str] = []
 
     if body.advanced_search:
         try:
@@ -936,6 +1384,9 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
             except Exception as e2:
                 logger.warning("Query analysis failed, using original: %s", e2)
                 search_queries = [query_text]
+        sub_questions = _split_compound_query(query_text)
+        contextual_subs = [_build_contextual_query(sq, conversation_history) for sq in sub_questions]
+        search_queries = _merge_query_variants(contextual_subs, search_queries, max_items=6)
     else:
         try:
             query_analysis, search_queries = analyze_and_rewrite_query(query_text)
@@ -943,59 +1394,35 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
             logger.warning("Query analysis failed, using original: %s", e)
             search_queries = [query_text]
 
-    # Multi-query retrieval: embed each variant and merge with RRF
+    retrieval_query = _build_contextual_query(query_text, conversation_history)
+    if retrieval_query != query_text:
+        search_queries = [retrieval_query] + [q for q in search_queries if q != retrieval_query][:5]
+
+    retrieve_k = max(int(body.k or 0), 10)
     try:
-        query_embeddings = [get_embedding(q) for q in search_queries[:6]]
+        results, chunk_dicts = _retrieve_with_metadata_first(
+            db=db,
+            project_id=body.project_id,
+            query_text=query_text,
+            queries=search_queries[:6],
+            n_results=retrieve_k,
+        )
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Embedding failed: {e}")
+        raise HTTPException(status_code=503, detail=_embedding_failure_detail(e))
 
-    raw = query_collection_multi(
-        project_id=body.project_id,
-        query_embeddings=query_embeddings,
-        n_results_per_query=min(15, max(5, body.k // len(query_embeddings))),
-        total_results=body.k,
+    results, reranked_chunks = _rerank_results_by_metadata(
+        db, body.project_id, query_text, results, chunk_dicts
     )
-
-    ids = (raw.get("ids") or [[]])[0]
-    documents = (raw.get("documents") or [[]])[0]
-    metadatas = (raw.get("metadatas") or [[]])[0]
-    distances = (raw.get("distances") or [[]])[0]
-
-    results: list[SearchResultItem] = []
-    chunk_dicts: list[dict] = []
-
-    for i in range(len(ids)):
-        meta = metadatas[i] if i < len(metadatas) else {}
-        doc_id = meta.get("document_id")
-        chunk_idx = meta.get("chunk_index", 0)
-        filename = meta.get("filename") or ""
-        content = documents[i] if i < len(documents) else ""
-        dist = float(distances[i]) if i < len(distances) else 0.0
-        score = 1.0 / (1.0 + dist) if dist is not None else 0.0
-        if doc_id is not None:
-            item = SearchResultItem(
-                content=content,
-                document_id=str(doc_id),
-                filename=filename,
-                chunk_index=int(chunk_idx),
-                distance=dist,
-                score=round(score, 4),
-            )
-            results.append(item)
-            chunk_dicts.append({
-                "content": content,
-                "filename": filename,
-                "score": score,
-                "document_id": str(doc_id),
-                "chunk_index": int(chunk_idx),
-                "distance": dist,
-            })
+    if reranked_chunks is not None:
+        chunk_dicts = reranked_chunks
 
     # Layer 3: Evidence bundling
     bundled = bundle_evidence(chunk_dicts)
 
-    # Layer 4: Reranking
-    reranked = rerank_chunks(query_text, bundled, top_k=body.top_k)
+    # Layer 4: Reranking or weighted fusion (Search balance)
+    reranked = _finalize_chunks_for_answer(
+        query_text, bundled, search_balance=body.search_balance, top_k=body.top_k
+    )
     if reranked:
         chunk_dicts = reranked
         results = [
@@ -1004,16 +1431,31 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
                 document_id=str(c.get("document_id", "")),
                 filename=c.get("filename", ""),
                 chunk_index=int(c.get("chunk_index", 0)),
+                section=(c.get("section") or None),
+                breadcrumb=(c.get("breadcrumb") or None),
+                page_start=_opt_positive_int(c.get("page_start")),
+                page_end=_opt_positive_int(c.get("page_end")),
+                source_url=None,
                 distance=c.get("distance", 0.0),
                 score=round(c.get("score", 0.0), 4),
             )
             for c in chunk_dicts
         ]
 
+    chunk_dicts = _filter_chunk_dicts_by_confidence(chunk_dicts)
+    results = _filter_results_by_confidence(results)
+    results = _enrich_results_source_urls(db, body.project_id, results)
+
     # Answer synthesis
     try:
+        synthesis_question = _build_synthesis_question(query_text, sub_questions)
         answer, topics_covered, confidence, uncertainty_note, missing_info_note = (
-            reasoning_answer_from_chunks(query_text, chunk_dicts, query_analysis)
+            reasoning_answer_from_chunks(
+                synthesis_question,
+                chunk_dicts,
+                query_analysis,
+                conversation_history=conversation_history,
+            )
         )
     except Exception as e:
         logger.exception("Reasoning answer failed: %s", e)
@@ -1075,14 +1517,13 @@ def search_reasoning(body: ReasoningRequest, db: DbSession, current_user: Curren
     latency_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
     search_query_id: int | None = None
     conversation_id_out: str | None = None
-    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
     try:
         sq_row = save_reasoning_search(
             db,
             actor_user_id=current_user.id,
             conversation_id=conv_id,
             query_text=query_text,
-            k=body.k,
+            k=retrieve_k,
             results_count=len(results),
             latency_ms=latency_ms,
             answer=answer,
@@ -1148,6 +1589,9 @@ def _reasoning_stream_generator(
     intelligence_clarification_questions: list[str] = []
     query_analysis: dict = {}
     search_queries: list[str] = [query_text]
+    conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
+    conversation_history = _load_recent_conversation_history(db, conv_id)
+    sub_questions: list[str] = []
 
     try:
         yield _sse("status", {"step": "thinking", "message": "Analyzing your question..."})
@@ -1166,12 +1610,19 @@ def _reasoning_stream_generator(
                     query_analysis, search_queries = analyze_and_rewrite_query(query_text)
                 except Exception:
                     search_queries = [query_text]
+            sub_questions = _split_compound_query(query_text)
+            contextual_subs = [_build_contextual_query(sq, conversation_history) for sq in sub_questions]
+            search_queries = _merge_query_variants(contextual_subs, search_queries, max_items=6)
         else:
             try:
                 query_analysis, search_queries = analyze_and_rewrite_query(query_text)
             except Exception as e:
                 logger.warning("Query analysis failed, using original: %s", e)
                 search_queries = [query_text]
+
+        retrieval_query = _build_contextual_query(query_text, conversation_history)
+        if retrieval_query != query_text:
+            search_queries = [retrieval_query] + [q for q in search_queries if q != retrieval_query][:5]
 
         if query_analysis:
             yield _sse("query_analysis", {
@@ -1186,55 +1637,28 @@ def _reasoning_stream_generator(
 
         yield _sse("status", {"step": "retrieval", "message": "Searching documents..."})
 
-        # Multi-query retrieval
-        query_embeddings = [get_embedding(q) for q in search_queries[:6]]
-        raw = query_collection_multi(
+        retrieve_k = max(int(body.k or 0), 10)
+        results, chunk_dicts = _retrieve_with_metadata_first(
+            db=db,
             project_id=body.project_id,
-            query_embeddings=query_embeddings,
-            n_results_per_query=min(15, max(5, body.k // len(query_embeddings))),
-            total_results=body.k,
+            query_text=query_text,
+            queries=search_queries[:6],
+            n_results=retrieve_k,
         )
 
-        ids = (raw.get("ids") or [[]])[0]
-        documents = (raw.get("documents") or [[]])[0]
-        metadatas = (raw.get("metadatas") or [[]])[0]
-        distances = (raw.get("distances") or [[]])[0]
-
-        results: list[SearchResultItem] = []
-        chunk_dicts: list[dict] = []
-
-        for i in range(len(ids)):
-            meta = metadatas[i] if i < len(metadatas) else {}
-            doc_id = meta.get("document_id")
-            chunk_idx = meta.get("chunk_index", 0)
-            filename = meta.get("filename") or ""
-            content = documents[i] if i < len(documents) else ""
-            dist = float(distances[i]) if i < len(distances) else 0.0
-            score = 1.0 / (1.0 + dist) if dist is not None else 0.0
-            if doc_id is not None:
-                item = SearchResultItem(
-                    content=content,
-                    document_id=str(doc_id),
-                    filename=filename,
-                    chunk_index=int(chunk_idx),
-                    distance=dist,
-                    score=round(score, 4),
-                )
-                results.append(item)
-                chunk_dicts.append({
-                    "content": content,
-                    "filename": filename,
-                    "score": score,
-                    "document_id": str(doc_id),
-                    "chunk_index": int(chunk_idx),
-                    "distance": dist,
-                })
+        results, reranked_chunks = _rerank_results_by_metadata(
+            db, body.project_id, query_text, results, chunk_dicts
+        )
+        if reranked_chunks is not None:
+            chunk_dicts = reranked_chunks
 
         bundled = bundle_evidence(chunk_dicts)
 
         yield _sse("status", {"step": "reranking", "message": "Reranking results..."})
 
-        reranked = rerank_chunks(query_text, bundled, top_k=body.top_k)
+        reranked = _finalize_chunks_for_answer(
+            query_text, bundled, search_balance=body.search_balance, top_k=body.top_k
+        )
         if reranked:
             chunk_dicts = reranked
             results = [
@@ -1243,11 +1667,20 @@ def _reasoning_stream_generator(
                     document_id=str(c.get("document_id", "")),
                     filename=c.get("filename", ""),
                     chunk_index=int(c.get("chunk_index", 0)),
+                    section=(c.get("section") or None),
+                    breadcrumb=(c.get("breadcrumb") or None),
+                    page_start=_opt_positive_int(c.get("page_start")),
+                    page_end=_opt_positive_int(c.get("page_end")),
+                    source_url=None,
                     distance=c.get("distance", 0.0),
                     score=round(c.get("score", 0.0), 4),
                 )
                 for c in chunk_dicts
             ]
+
+        chunk_dicts = _filter_chunk_dicts_by_confidence(chunk_dicts)
+        results = _filter_results_by_confidence(results)
+        results = _enrich_results_source_urls(db, body.project_id, results)
 
         # Emit search results for the reasoning log (questions + results)
         search_results_payload = {
@@ -1265,8 +1698,14 @@ def _reasoning_stream_generator(
 
         yield _sse("status", {"step": "synthesizing", "message": "Synthesizing answer..."})
 
+        synthesis_question = _build_synthesis_question(query_text, sub_questions)
         answer, topics_covered, confidence, uncertainty_note, missing_info_note = (
-            reasoning_answer_from_chunks(query_text, chunk_dicts, query_analysis)
+            reasoning_answer_from_chunks(
+                synthesis_question,
+                chunk_dicts,
+                query_analysis,
+                conversation_history=conversation_history,
+            )
         )
 
         # Self-check
@@ -1323,14 +1762,13 @@ def _reasoning_stream_generator(
         latency_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
         search_query_id: int | None = None
         conversation_id_out: str | None = None
-        conv_id = _resolve_conversation_id(db, getattr(body, "conversation_id", None))
         try:
             sq_row = save_reasoning_search(
                 db,
                 actor_user_id=current_user.id,
                 conversation_id=conv_id,
                 query_text=query_text,
-                k=body.k,
+                k=retrieve_k,
                 results_count=len(results),
                 latency_ms=latency_ms,
                 answer=answer,
@@ -1432,7 +1870,11 @@ def _format_size(bytes_val: int) -> str:
 
 
 @router.get("/intelligence", response_model=IntelligenceHubResponse)
-def get_intelligence_hub(db: DbSession, project_id: str | None = None):
+def get_intelligence_hub(
+    db: DbSession,
+    current_user: CurrentUserOptional,
+    project_id: str | None = None,
+):
     """
     Intelligence Hub dashboard data from search_queries and documents.
     - most_searched_topics: from search_queries.topic (comma-separated values split and counted)
@@ -1440,6 +1882,7 @@ def get_intelligence_hub(db: DbSession, project_id: str | None = None):
     - gaps_in_knowledge: queries with 0 results (high) or low confidence (medium/low)
     - recently_uploaded: latest documents from the project
     """
+    require_admin_only(current_user)
     # Resolve project: use first non-deleted if not specified
     pid = project_id
     if not pid:

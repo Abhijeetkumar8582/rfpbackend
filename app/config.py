@@ -21,10 +21,12 @@ class Settings(BaseSettings):
     app_env: str = "development"
     secret_key: str = "change-me-in-production"
     api_v1_prefix: str = "/api/v1"
+    # Public base URL for links in API responses (e.g. source PDF open URL when s3_url is absent)
+    backend_public_url: str = "http://127.0.0.1:8000"
 
-    # JWT
-    access_token_expire_minutes: int = 30
-    refresh_token_expire_days: int = 7
+    # JWT — access and refresh both align to a 6-hour session window (override via env).
+    access_token_expire_minutes: int = 360
+    refresh_token_expire_hours: int = 6
     jwt_algorithm: str = "HS256"
 
     database_url: str = "sqlite:///./rfp.db"
@@ -55,8 +57,25 @@ class Settings(BaseSettings):
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
 
-    # ChromaDB (vector store — one client, one collection per folder/project)
-    chroma_persist_path: str = "./chroma_data"
+    # Qdrant (vector store)
+    # Default: on-disk embedded storage (no server on 6333). Same idea as pdf_qdrant_api.py --path.
+    # Set to "-", "none", or "remote" (case-insensitive) to use qdrant_url only (Qdrant Cloud / local server).
+    qdrant_local_path: str = ".qdrant_local"
+    qdrant_url: str = "http://127.0.0.1:6333"
+    qdrant_api_key: str = ""
+    qdrant_collection_prefix: str = "folder"
+    # Per-user Qdrant collections: vd_{slug}_{user_id} — slug from display name
+    qdrant_user_collection_prefix: str = "vd"
+    qdrant_timeout_sec: int = 30
+    hybrid_dense_weight: float = 0.75
+    hybrid_sparse_weight: float = 0.25
+    # When true and qdrant_url points at localhost, the backend spawns a local qdrant process on startup
+    # if none is already reachable. Set false if you use a remote Qdrant or start Qdrant yourself.
+    qdrant_auto_start: bool = True
+    # Path to qdrant executable; empty = look for "qdrant" / "qdrant.exe" on PATH
+    qdrant_binary_path: str = ""
+    # On-disk storage for the embedded process; empty = <backend_root>/.qdrant_storage
+    qdrant_storage_path: str = ""
 
     # Chunking (word-based: 100, 200 words per chunk)
     chunk_size_words: int = 200

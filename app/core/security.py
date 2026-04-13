@@ -43,7 +43,7 @@ def create_refresh_token_pair(sub: int | str | uuid.UUID) -> tuple[str, str]:
     Create a refresh token string and its hash for DB storage.
     Returns (raw_token, token_hash).
     """
-    expire = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days)
+    expire = datetime.now(timezone.utc) + timedelta(hours=settings.refresh_token_expire_hours)
     raw = secrets.token_urlsafe(48)
     payload = {"sub": str(sub), "exp": expire, "type": "refresh", "jti": raw}
     encoded = jwt.encode(

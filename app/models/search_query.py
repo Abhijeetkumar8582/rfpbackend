@@ -18,7 +18,7 @@ class SearchQuery(Base):
     datetime_: Mapped[datetime] = mapped_column("datetime", DateTime(timezone=True), nullable=False)
     # Chat grouping: same conversation_id for follow-up queries; valid 24h from first query in conversation
     conversation_id: Mapped[str] = mapped_column(String(CONVERSATION_ID_LENGTH), nullable=False)
-    actor_user_id: Mapped[str | None] = mapped_column(String(USER_ID_LENGTH), ForeignKey("users.id"), nullable=True)
+    actor_user_id: Mapped[str | None] = mapped_column(String(USER_ID_LENGTH), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     query_text: Mapped[str] = mapped_column(Text, nullable=False)
     k: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     filters_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)

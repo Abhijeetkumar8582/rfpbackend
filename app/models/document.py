@@ -2,6 +2,7 @@
 import enum
 from datetime import datetime
 from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -30,14 +31,18 @@ class Document(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     storage_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    s3_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     status: Mapped[DocumentStatus] = mapped_column(Enum(DocumentStatus), nullable=False, default=DocumentStatus.pending)
-    uploaded_by: Mapped[str] = mapped_column(String(USER_ID_LENGTH), ForeignKey("users.id"), nullable=False)
+    uploaded_by: Mapped[str | None] = mapped_column(String(USER_ID_LENGTH), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ingested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Auto-categorization (cluster) and vector embedding for file repo / search
     cluster: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    embedding_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_json: Mapped[str | None] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=True,
+    )
     # GPT-generated metadata (title, description, doc_type, tags, taxonomy_suggestions)
     doc_title: Mapped[str | None] = mapped_column(String(256), nullable=True)
     doc_description: Mapped[str | None] = mapped_column(Text, nullable=True)

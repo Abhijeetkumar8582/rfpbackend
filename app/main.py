@@ -20,6 +20,7 @@ async def lifespan(app: FastAPI):
     """Create tables on startup; optionally run migrations."""
     from datetime import datetime, timezone, timedelta
     from app.database import SessionLocal
+    from app.core.project_id import generate_project_id
     from app.models.project import Project
     from app.models.endpoint_log import EndpointLog
     from app.models.search_query import SearchQuery
@@ -53,10 +54,10 @@ async def lifespan(app: FastAPI):
                     conn.rollback()
                 except Exception:
                     pass
-    # Add missing columns to documents if DB was created from older schema (e.g. Unknown column 'cluster')
+    # Add missing columns to documents if DB was created from older schema
     if "mysql" in (settings.database_url or ""):
         with engine.connect() as conn:
-            for col, spec in [("cluster", "VARCHAR(128) NULL"), ("embedding_json", "TEXT NULL")]:
+            for col, spec in [("cluster", "VARCHAR(128) NULL"), ("embedding_json", "TEXT NULL"), ("s3_url", "VARCHAR(2048) NULL")]:
                 try:
                     conn.execute(text(f"ALTER TABLE documents ADD COLUMN {col} {spec}"))
                     conn.commit()
@@ -65,6 +66,45 @@ async def lifespan(app: FastAPI):
                         conn.rollback()
                     else:
                         raise
+    else:
+        with engine.connect() as conn:
+            for col, spec in [("cluster", "TEXT"), ("embedding_json", "TEXT"), ("s3_url", "TEXT")]:
+                try:
+                    conn.execute(text(f"ALTER TABLE documents ADD COLUMN {col} {spec}"))
+                    conn.commit()
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if "duplicate column name" in err_msg or "already exists" in err_msg:
+                        conn.rollback()
+                    else:
+                        raise
+    # MySQL TEXT (~64KB) is too small for many chunk embeddings JSON — widen existing tables
+    if "mysql" in (settings.database_url or ""):
+        with engine.connect() as conn:
+            for modify_sql in (
+                "ALTER TABLE document_chunks MODIFY COLUMN embeddings_json LONGTEXT NULL",
+                "ALTER TABLE documents MODIFY COLUMN embedding_json LONGTEXT NULL",
+            ):
+                try:
+                    conn.execute(text(modify_sql))
+                    conn.commit()
+                except Exception as e:
+                    err_s = str(e).lower()
+                    if "1146" in str(e) or "doesn't exist" in err_s or "unknown column" in err_s:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                    else:
+                        logging.getLogger(__name__).warning(
+                            "MySQL widen column skipped or failed (%s): %s",
+                            modify_sql.split("MODIFY")[0].strip(),
+                            e,
+                        )
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
     # Add missing columns to endpoint_logs (query_string, request_headers, request_body, response_headers, response_body)
     with engine.connect() as conn:
         if "mysql" in (settings.database_url or ""):
@@ -127,12 +167,127 @@ async def lifespan(app: FastAPI):
                     pass
             else:
                 raise
+    # rfpquestions.conversation_id — groups SearchQuery rows for one Excel bulk Q&A thread
+    with engine.connect() as conn:
+        if "mysql" in (settings.database_url or ""):
+            rfp_conv_sql = "ALTER TABLE rfpquestions ADD COLUMN conversation_id VARCHAR(32) NULL"
+        else:
+            rfp_conv_sql = "ALTER TABLE rfpquestions ADD COLUMN conversation_id VARCHAR(32) NULL"
+        try:
+            conn.execute(text(rfp_conv_sql))
+            conn.commit()
+        except Exception as e:
+            err_msg = str(e).lower()
+            err_code = getattr(getattr(e, "orig", None), "args", [None])[0] if hasattr(e, "orig") else None
+            if (
+                "1060" in str(e)
+                or "duplicate column" in err_msg
+                or (err_code == 1060)
+                or (err_code == 1146)
+                or "doesn't exist" in err_msg
+            ):
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            else:
+                raise
+    # rfpquestions.collaborator_user_ids — comma-separated user ids (shared My RFPs access)
+    # MySQL forbids DEFAULT on TEXT; use VARCHAR (see pymysql 1101).
+    with engine.connect() as conn:
+        if "mysql" in (settings.database_url or ""):
+            rfp_collab_sql = (
+                "ALTER TABLE rfpquestions ADD COLUMN collaborator_user_ids "
+                "VARCHAR(8192) NOT NULL DEFAULT ''"
+            )
+        else:
+            rfp_collab_sql = (
+                "ALTER TABLE rfpquestions ADD COLUMN collaborator_user_ids TEXT NOT NULL DEFAULT ''"
+            )
+        try:
+            conn.execute(text(rfp_collab_sql))
+            conn.commit()
+        except Exception as e:
+            err_msg = str(e).lower()
+            err_code = getattr(getattr(e, "orig", None), "args", [None])[0] if hasattr(e, "orig") else None
+            if (
+                "1060" in str(e)
+                or "duplicate column" in err_msg
+                or (err_code == 1060)
+                or (err_code == 1146)
+                or "doesn't exist" in err_msg
+            ):
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            else:
+                raise
+    # users.vector_database — Qdrant collection name for per-user vector store
+    with engine.connect() as conn:
+        if "mysql" in (settings.database_url or ""):
+            vdb_sql = "ALTER TABLE `users` ADD COLUMN vector_database VARCHAR(255) NULL"
+        else:
+            vdb_sql = "ALTER TABLE users ADD COLUMN vector_database TEXT NULL"
+        try:
+            conn.execute(text(vdb_sql))
+            conn.commit()
+        except Exception as e:
+            err_msg = str(e).lower()
+            err_code = getattr(getattr(e, "orig", None), "args", [None])[0] if hasattr(e, "orig") else None
+            if (
+                "1060" in str(e)
+                or "duplicate column" in err_msg
+                or (err_code == 1060)
+                or (err_code == 1146)
+                or "doesn't exist" in err_msg
+            ):
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            else:
+                raise
+    # projects — per-project chunk defaults and metadata preference (train / upload)
+    with engine.connect() as conn:
+        if "mysql" in (settings.database_url or ""):
+            proj_cols = [
+                ("chunk_size_words", "INT NULL"),
+                ("chunk_overlap_words", "INT NULL"),
+                ("include_metadata_in_retrieval", "TINYINT(1) NOT NULL DEFAULT 1"),
+            ]
+        else:
+            proj_cols = [
+                ("chunk_size_words", "INTEGER"),
+                ("chunk_overlap_words", "INTEGER"),
+                ("include_metadata_in_retrieval", "BOOLEAN NOT NULL DEFAULT 1"),
+            ]
+        for col, spec in proj_cols:
+            try:
+                conn.execute(text(f"ALTER TABLE projects ADD COLUMN {col} {spec}"))
+                conn.commit()
+            except Exception as e:
+                err_msg = str(e).lower()
+                err_code = getattr(getattr(e, "orig", None), "args", [None])[0] if hasattr(e, "orig") else None
+                if (
+                    "1060" in str(e)
+                    or "duplicate column" in err_msg
+                    or (err_code == 1060)
+                    or "already exists" in err_msg
+                ):
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                else:
+                    raise
     # Ensure at least one default project exists
     db = SessionLocal()
     try:
         existing = db.execute(select(Project).where(Project.is_deleted == False)).scalars().first()
         if not existing:
             default = Project(
+                id=generate_project_id(db),
                 name="Default Project",
                 description="Default project for document uploads",
                 retention_days=365,
@@ -236,8 +391,12 @@ async def lifespan(app: FastAPI):
                 db.commit()
     finally:
         db.close()
+
+    from app.services.qdrant_process import start_qdrant_if_configured, stop_qdrant_if_started
+
+    start_qdrant_if_configured()
     yield
-    # Shutdown: close connections, etc.
+    stop_qdrant_if_started()
 
 
 app = FastAPI(
@@ -274,9 +433,16 @@ def _cors_headers(request: Request):
 async def add_cors_to_exception_response(request: Request, exc: Exception):
     """Ensure CORS headers on all exception responses so browser can read error (avoids 'blocked by CORS policy')."""
     from fastapi.exceptions import HTTPException as FastAPIHTTPException
+
     if isinstance(exc, FastAPIHTTPException):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=_cors_headers(request))
-    return JSONResponse(status_code=500, content={"detail": f"Processing failed: {exc!s}"}, headers=_cors_headers(request))
+    env = (settings.app_env or "").lower()
+    if env in ("production", "prod", "staging"):
+        logging.getLogger(__name__).exception("Unhandled server error")
+        detail = "An unexpected error occurred. Please try again later."
+    else:
+        detail = f"Processing failed: {exc!s}"
+    return JSONResponse(status_code=500, content={"detail": detail}, headers=_cors_headers(request))
 
 
 @app.get("/health")

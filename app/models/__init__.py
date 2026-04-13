@@ -1,5 +1,6 @@
 """SQLAlchemy ORM models."""
 from app.models.user import User
+from app.models.user_kb_settings import UserKbSettings
 from app.models.refresh_token import RefreshToken
 from app.models.api_key import ApiKey
 from app.models.project import Project, ProjectMember
@@ -18,6 +19,7 @@ from app.models.user_invite import UserInvite
 
 __all__ = [
     "User",
+    "UserKbSettings",
     "RefreshToken",
     "ApiKey",
     "Project",

@@ -22,7 +22,7 @@ def generate_project_id(db: Session) -> str:
     # Fetch all ids with this prefix and compute max sequence (few projects per year)
     rows = db.execute(select(Project.id).where(Project.id.like(f"{prefix}%"))).scalars().all()
     max_seq = 0
-    for (id_val,) in rows:
+    for id_val in rows:
         try:
             num_part = id_val.split("-")[-1]
             max_seq = max(max_seq, int(num_part))

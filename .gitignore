@@ -9,5 +9,6 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
-.env.example
 .env.*
+.qdrant_local/
+*.lock

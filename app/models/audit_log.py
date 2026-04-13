@@ -14,7 +14,7 @@ class AuditLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    actor_user_id: Mapped[str | None] = mapped_column(String(USER_ID_LENGTH), ForeignKey("users.id"), nullable=True)
+    actor_user_id: Mapped[str | None] = mapped_column(String(USER_ID_LENGTH), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     action: Mapped[str] = mapped_column(String(128), nullable=False)
     resource_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     resource_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

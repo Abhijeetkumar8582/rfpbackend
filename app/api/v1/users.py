@@ -6,14 +6,20 @@ import secrets
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select, update
 
-from app.api.deps import DbSession, CurrentUserOptional
+from app.api.deps import DbSession, CurrentUser, CurrentUserOptional
 from app.config import settings
 from app.core.security import hash_password, create_invite_token
 from app.core.user_id import generate_user_id
 from app.models.user import User, UserRole
+from app.models.user_kb_settings import UserKbSettings
 from app.models.user_invite import UserInvite
 from app.models.search_query import SearchQuery
-from app.schemas.user import UserResponse, UserUpdate
+from app.models.document import Document
+from app.models.audit_log import AuditLog
+from app.schemas.user import CollaborationUserOut, UserResponse, UserUpdate, UserVectorDatabaseResponse
+from app.schemas.search import SearchBalance
+from app.services.embeddings import is_embedding_configured
+from app.services.qdrant import provision_user_vector_database
 from app.schemas.invite import UserInviteCreate, UserInviteCreatedResponse
 from app.schemas.common import Message
 from app.services.email import send_email
@@ -44,6 +50,68 @@ def _get_user_or_404(db: DbSession, user_id: str) -> User:
     return user
 
 
+@router.post("/me/vector-database", response_model=UserVectorDatabaseResponse)
+def ensure_my_vector_database(db: DbSession, current_user: CurrentUser):
+    """
+    Create a dedicated Qdrant collection for the current user (name derived from their display name
+    and user id) and save the collection name on the user as `vector_database`.
+    Idempotent: safe to call again; reuses the stored collection name when already set.
+    Requires embedding API configuration (same as document indexing) to determine vector size.
+    """
+    if not is_embedding_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Embedding API not configured. Set OPENAI_API_KEY and OPENAI_BASE_URL (or OPENAI_EMBEDDING_BASE_URL) to provision a vector database.",
+        )
+    user = db.get(User, current_user.id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    name = provision_user_vector_database(user.id, user.name, user.vector_database)
+    user.vector_database = name
+    db.commit()
+    db.refresh(user)
+    return UserVectorDatabaseResponse(vector_database=name)
+
+
+_DEFAULT_KB_SETTINGS = SearchBalance(text_pct=30, vector_pct=60, rerank_pct=10)
+
+
+@router.get("/me/kb-settings", response_model=SearchBalance)
+def get_my_kb_settings(db: DbSession, current_user: CurrentUser):
+    """
+    Search balance (Text / Vector / Rerank %) for the RFP Assistant.
+    Returns defaults until the user saves preferences via PUT.
+    """
+    row = db.get(UserKbSettings, current_user.id)
+    if not row:
+        return _DEFAULT_KB_SETTINGS
+    return SearchBalance(text_pct=row.text_pct, vector_pct=row.vector_pct, rerank_pct=row.rerank_pct)
+
+
+@router.put("/me/kb-settings", response_model=SearchBalance)
+def put_my_kb_settings(body: SearchBalance, db: DbSession, current_user: CurrentUser):
+    """Persist Search balance weights for the current user."""
+    now = datetime.now(timezone.utc)
+    row = db.get(UserKbSettings, current_user.id)
+    if row:
+        row.text_pct = body.text_pct
+        row.vector_pct = body.vector_pct
+        row.rerank_pct = body.rerank_pct
+        row.updated_at = now
+    else:
+        db.add(
+            UserKbSettings(
+                user_id=current_user.id,
+                text_pct=body.text_pct,
+                vector_pct=body.vector_pct,
+                rerank_pct=body.rerank_pct,
+                updated_at=now,
+            )
+        )
+    db.commit()
+    return body
+
+
 def _map_role_label_to_enum(label: str) -> UserRole:
     """
     Map human-friendly role label from UI to internal UserRole enum.
@@ -61,6 +129,23 @@ def _map_role_label_to_enum(label: str) -> UserRole:
     if s == "developer":
         return UserRole.analyst
     return UserRole.viewer
+
+
+@router.get("/collaboration-directory", response_model=list[CollaborationUserOut])
+def collaboration_directory(
+    db: DbSession,
+    current_user: CurrentUser,
+    limit: int = Query(200, ge=1, le=500),
+):
+    """List active users (except self) for adding RFP collaborators. Any authenticated user."""
+    stmt = (
+        select(User)
+        .where(User.is_active.is_(True), User.id != current_user.id)
+        .order_by(User.name.asc(), User.email.asc())
+        .limit(limit)
+    )
+    rows = db.execute(stmt).scalars().all()
+    return [CollaborationUserOut(id=u.id, name=u.name or "", email=u.email or "") for u in rows]
 
 
 @router.get("", response_model=list[UserResponse])
@@ -121,7 +206,8 @@ def delete_user(
     Delete user. Only Super Admin or Admin. Requires authentication.
 
     - **Soft delete (default)**: Sets is_active=False; user can be reactivated via PATCH.
-    - **Permanent (permanent=true)**: Removes the user row. Fails if user has uploaded documents.
+    - **Permanent (permanent=true)**: Removes the user row. Linked records
+      (documents, audit logs, search queries) are kept with the user reference set to NULL.
     """
     _require_admin_or_manager(current_user)
     user = _get_user_or_404(db, user_id)
@@ -131,19 +217,21 @@ def delete_user(
         db.commit()
         return Message(message="User deactivated")
 
-    # Hard delete: nullify FKs that reference this user, then delete
+    # Hard delete: nullify all nullable FKs that reference this user, then delete the row.
+    # Related records (documents, audit logs, search queries) are kept with uploader set to NULL.
     try:
+        db.execute(update(Document).where(Document.uploaded_by == user_id).values(uploaded_by=None))
         db.execute(update(SearchQuery).where(SearchQuery.actor_user_id == user_id).values(actor_user_id=None))
+        db.execute(update(AuditLog).where(AuditLog.actor_user_id == user_id).values(actor_user_id=None))
         db.delete(user)
         db.commit()
     except Exception as e:
         db.rollback()
-        if "foreign key" in str(e).lower() or "integrity" in str(e).lower():
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot permanently delete user: they have linked records (e.g. uploaded documents). Use soft delete instead.",
-            ) from e
-        raise
+        logger.exception("Failed to permanently delete user %s", user_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to delete user. Please try again.",
+        ) from e
     return Message(message="User permanently deleted")
 
 

@@ -1,6 +1,20 @@
 """Search schemas."""
 from datetime import datetime
-from pydantic import BaseModel, Field, field_validator, field_validator, field_validator
+from pydantic import BaseModel, Field, model_validator
+
+
+class SearchBalance(BaseModel):
+    """Hybrid retrieval weights from the Search balance UI (Text / Vector / Rerank), total 100%."""
+
+    text_pct: int = Field(..., ge=5, le=90)
+    vector_pct: int = Field(..., ge=5, le=90)
+    rerank_pct: int = Field(..., ge=5, le=90)
+
+    @model_validator(mode="after")
+    def must_sum_to_100(self):
+        if self.text_pct + self.vector_pct + self.rerank_pct != 100:
+            raise ValueError("text_pct, vector_pct, and rerank_pct must sum to 100")
+        return self
 
 
 class SearchRequest(BaseModel):
@@ -10,6 +24,7 @@ class SearchRequest(BaseModel):
     filters_json: dict | None = None
     advanced_search: bool = False  # When True, run Query Intelligence Layer before retrieval
     conversation_id: str | None = None  # Optional; same id for follow-up queries (valid 24h)
+    search_balance: SearchBalance | None = None  # When set, fuse keyword / vector / cross-encoder scores (answer path)
 
 
 class SearchResultItem(BaseModel):
@@ -18,6 +33,11 @@ class SearchResultItem(BaseModel):
     document_id: str
     filename: str
     chunk_index: int
+    section: str | None = None
+    breadcrumb: str | None = None
+    page_start: int | None = None  # 1-based PDF page (when indexed with page map)
+    page_end: int | None = None
+    source_url: str | None = None  # document URL with #page=N when available
     distance: float
     score: float  # 1 - distance for cosine-like; higher = more similar
 
@@ -33,6 +53,7 @@ class SourceItem(BaseModel):
     section: str | None = None
     snippet: str  # Truncated content preview
     score: float
+    source_url: str | None = None  # Open PDF at page (s3_url or API download + #page=)
 
 
 class ConfidenceScores(BaseModel):
@@ -163,6 +184,7 @@ class ReasoningRequest(BaseModel):
     skip_self_check: bool = False  # Optional: skip self-check for faster response
     advanced_search: bool = False  # When True, use Query Intelligence Layer (cleanup, intent, split, rewrite, domain, filters, clarification, plan)
     conversation_id: str | None = None  # Optional; same id for follow-up queries (valid 24h)
+    search_balance: SearchBalance | None = None  # When set, fuse keyword / vector / cross-encoder scores before synthesis
 
 
 class QueryAnalysis(BaseModel):

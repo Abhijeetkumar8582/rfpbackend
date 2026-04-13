@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import copy
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 
 from app.config import settings
 from app.services.openai_client import get_chat_client
+from app.services.search_answer import UNANSWERED_PREFIX, ensure_unanswered_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +91,7 @@ def validate_faq_answers(
             {"role": "system", "content": "You output only valid JSON. No markdown, no explanation."},
             {"role": "user", "content": prompt},
         ],
-        max_tokens=512,
+        max_tokens=8000,
         timeout=60.0,
     )
     content = ((resp.choices[0].message.content or "") if resp and resp.choices else "")
@@ -174,7 +176,7 @@ Respond with valid JSON only. Use this exact structure:
     try:
         out = _gpt_json(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=1024,
+            max_tokens=8000,
         )
     except Exception as e:
         logger.warning("Query analysis failed: %s", e)
@@ -267,6 +269,91 @@ def rerank_chunks(question: str, chunks: list[dict], top_k: int = 12) -> list[di
     return [c for c, _ in scored[:top_k]]
 
 
+def _keyword_overlap_score(query: str, content: str) -> float:
+    """Normalized overlap of query terms with chunk text (0–1). Supports Unicode words."""
+    words = re.findall(r"\w+", (query or "").lower(), flags=re.UNICODE)
+    cwords = re.findall(r"\w+", (content or "").lower(), flags=re.UNICODE)
+    qset = {w for w in words if len(w) > 1}
+    cset = set(cwords)
+    if not qset:
+        return 0.0
+    return len(qset & cset) / max(len(qset), 1)
+
+
+def _min_max_normalize(vals: list[float]) -> list[float]:
+    if not vals:
+        return []
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-9:
+        return [0.5 for _ in vals]
+    return [(v - lo) / (hi - lo) for v in vals]
+
+
+def apply_search_balance_fusion(
+    question: str,
+    chunks: list[dict],
+    *,
+    text_pct: int,
+    vector_pct: int,
+    rerank_pct: int,
+    top_k: int,
+) -> list[dict]:
+    """
+    Combine keyword overlap, vector similarity score, and cross-encoder rerank scores
+    using the UI weights (each 5–90, sum 100). Returns top_k chunks with fused `score`.
+    If the cross-encoder is unavailable, rerank weight is merged into text/vector proportionally.
+    """
+    if not chunks:
+        return []
+    n = len(chunks)
+    wt = text_pct / 100.0
+    wv = vector_pct / 100.0
+    wr = rerank_pct / 100.0
+
+    vec_raw = [float(c.get("score") or 0.0) for c in chunks]
+    text_raw = [_keyword_overlap_score(question, c.get("content") or "") for c in chunks]
+
+    model = _get_rerank_model()
+    rerank_raw: list[float]
+    if model:
+        pairs = [(question, (c.get("content") or "")[:2000]) for c in chunks]
+        try:
+            rr = model.predict(pairs)
+            if isinstance(rr, (int, float)):
+                rerank_raw = [float(rr)] * n
+            else:
+                rerank_raw = [float(x) for x in rr]
+            if len(rerank_raw) != n:
+                rerank_raw = (rerank_raw + [0.0] * n)[:n]
+        except Exception as e:
+            logger.warning("Rerank in fusion failed: %s", e)
+            rerank_raw = [0.0] * n
+            s = wt + wv
+            if s > 1e-9:
+                wt, wv = wt / s, wv / s
+            wr = 0.0
+    else:
+        rerank_raw = [0.0] * n
+        s = wt + wv
+        if s > 1e-9:
+            wt, wv = wt / s, wv / s
+        wr = 0.0
+
+    t_norm = _min_max_normalize(text_raw)
+    v_norm = _min_max_normalize(vec_raw)
+    r_norm = _min_max_normalize(rerank_raw)
+
+    out: list[dict] = []
+    for i, c in enumerate(chunks):
+        combined = wt * t_norm[i] + wv * v_norm[i] + wr * r_norm[i]
+        nc = copy.copy(c)
+        nc["score"] = round(combined, 6)
+        out.append(nc)
+
+    out.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    return out[: max(1, top_k)]
+
+
 # ---------------------------------------------------------------------------
 # Answer synthesis (enhanced with uncertainty + missing info)
 # ---------------------------------------------------------------------------
@@ -276,6 +363,7 @@ def reasoning_answer_from_chunks(
     question: str,
     chunks: list[dict],
     query_analysis: dict | None = None,
+    conversation_history: list[dict] | None = None,
 ) -> tuple[str, list[str], dict, str | None, str | None]:
     """
     Synthesize answer with citations, uncertainty note, and missing info note.
@@ -287,8 +375,9 @@ def reasoning_answer_from_chunks(
     empty_conf = {"overall": 0.0, "evidence_coverage": 0.0, "contradiction_risk": 0.0}
 
     if not chunks:
+        msg = "No relevant passages were found. Try rephrasing your question or adding more documents."
         return (
-            "No relevant passages were found. Try rephrasing your question or adding more documents.",
+            UNANSWERED_PREFIX + msg,
             empty_topics,
             empty_conf,
             "No evidence found.",
@@ -324,15 +413,17 @@ Be thorough rather than terse. If the passages are insufficient, say so and expl
 Respond with valid JSON only. Use this exact structure:
 {
   "answer": "your detailed, well-reasoned answer here (can be multiple paragraphs)",
+  "unanswered": false,
   "topics_covered": ["Topic1", "Topic2"],
   "confidence": {"overall": 0.81, "evidence_coverage": 0.76, "contradiction_risk": 0.12},
   "uncertainty_note": "Optional: any caveats or limitations",
   "missing_info_note": "Optional: what information is missing from the passages"
 }
 
-- answer: A strong, comprehensive answer. Not one sentence — include reasoning, evidence, and key details.
+- answer: A strong, comprehensive answer. Not one sentence — include reasoning, evidence, and key details when passages support it.
+- unanswered: required boolean. true if the passages do NOT contain enough information to answer the question. Do NOT prepend the text "Unanswered" to the answer field — the API adds a standard prefix when unanswered is true.
 - topics_covered: RFP topics (Payment terms, SLA, Security, Pricing, etc.). Use [] if none.
-- confidence: 0-1 floats.
+- confidence: 0-1 floats. Use low overall/evidence_coverage when unanswered is true.
 - uncertainty_note: null or string if answer has caveats.
 - missing_info_note: null or string if key info is missing from passages."""
 
@@ -343,7 +434,23 @@ Respond with valid JSON only. Use this exact structure:
         if intent or domain:
             analysis_hint = f"\nQuery context: intent={intent}, domain={domain}\n"
 
-    user_content = f"""Relevant passages:\n\n{context}\n\nQuestion: {_sanitize_text(question)}{analysis_hint}\n\nProduce a detailed, well-reasoned answer. Respond with JSON only."""
+    history_parts: list[str] = []
+    for i, h in enumerate(conversation_history or [], 1):
+        q = _sanitize_text((h or {}).get("query") or "")
+        a = _sanitize_text((h or {}).get("answer") or "")
+        if not q and not a:
+            continue
+        history_parts.append(f"Turn {i}:\nUser: {q[:300]}\nAssistant: {a[:500]}")
+    history_text = "\n\n".join(history_parts)
+
+    if history_text:
+        user_content = (
+            f"""Recent conversation context:\n\n{history_text}\n\nRelevant passages:\n\n{context}\n\nQuestion: {_sanitize_text(question)}{analysis_hint}\n\nUse the conversation context to resolve follow-up references. Produce a detailed, well-reasoned answer. Respond with JSON only."""
+        )
+    else:
+        user_content = (
+            f"""Relevant passages:\n\n{context}\n\nQuestion: {_sanitize_text(question)}{analysis_hint}\n\nProduce a detailed, well-reasoned answer. Respond with JSON only."""
+        )
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -360,6 +467,7 @@ Respond with valid JSON only. Use this exact structure:
     confidence = empty_conf.copy()
     uncertainty_note: str | None = None
     missing_info_note: str | None = None
+    unanswered_flag: bool | None = None
 
     if raw:
         try:
@@ -369,6 +477,8 @@ Respond with valid JSON only. Use this exact structure:
                 text = m.group(1).strip()
             parsed = json.loads(text)
             answer = (parsed.get("answer") or "").strip() or answer
+            if "unanswered" in parsed:
+                unanswered_flag = bool(parsed.get("unanswered"))
             raw_topics = parsed.get("topics_covered")
             if isinstance(raw_topics, list):
                 topics_covered = [str(t).strip() for t in raw_topics if t]
@@ -390,6 +500,7 @@ Respond with valid JSON only. Use this exact structure:
         except (json.JSONDecodeError, TypeError):
             answer = raw
 
+    answer = ensure_unanswered_prefix(answer, unanswered=unanswered_flag)
     return answer, topics_covered, confidence, uncertainty_note, missing_info_note
 
 
@@ -441,7 +552,7 @@ Respond with valid JSON only:
     try:
         out = _gpt_json(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=512,
+            max_tokens=8000,
         )
     except Exception as e:
         logger.warning("Self-check failed: %s", e)

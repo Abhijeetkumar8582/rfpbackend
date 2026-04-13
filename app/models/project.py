@@ -20,6 +20,11 @@ class Project(Base):
     auto_delete_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Per-project ingestion defaults (null = use global settings.chunk_size_words / chunk_overlap_words)
+    chunk_size_words: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    chunk_overlap_words: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Preference for future RAG/context enrichment (stored for consistency; search may evolve to use it)
+    include_metadata_in_retrieval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     members = relationship("ProjectMember", back_populates="project", cascade="all, delete-orphan")
     documents = relationship("Document", back_populates="project", cascade="all, delete-orphan")

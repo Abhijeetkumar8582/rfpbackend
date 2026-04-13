@@ -6,6 +6,23 @@ import json
 from app.config import settings
 
 
+def is_embedding_configured() -> bool:
+    """
+    True if get_embedding() can run: an API key (embedding or shared) and an embeddings URL
+    (OPENAI_EMBEDDING_BASE_URL or derivable OPENAI_BASE_URL) are set.
+    Used so chunk → embed → Qdrant runs when only embedding credentials are configured.
+    """
+    has_key = bool(
+        (settings.openai_embedding_api_key or "").strip()
+        or (settings.openai_api_key or "").strip()
+    )
+    if not has_key:
+        return False
+    if (settings.openai_embedding_base_url or "").strip():
+        return True
+    return bool((settings.openai_base_url or "").strip())
+
+
 def _embeddings_url() -> str:
     """
     Return the URL for the embeddings API. Use OPENAI_EMBEDDING_BASE_URL if set;

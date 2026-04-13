@@ -1,13 +1,18 @@
 """PDF image detection and OCR — extract text from scanned PDFs and embedded images."""
 from __future__ import annotations
 
+import base64
 import io
 import logging
+import uuid
 from typing import BinaryIO
 
 from app.config import settings
+from app.services.openai_client import get_chat_client
+from app.services.s3 import s3_upload, s3_download, s3_delete
 
 logger = logging.getLogger(__name__)
+TEMP_OCR_FOLDER = "Temporyfiles"
 
 
 def is_probably_scanned(pdf_path: str | bytes | BinaryIO, sample_pages: int = 3) -> bool:
@@ -91,8 +96,10 @@ def extract_images_and_ocr_text(
     pdf_content: bytes, max_pages: int = 100
 ) -> tuple[str, int]:
     """
-    Scan the whole PDF, extract all images (and render page images for scanned pages),
-    run OCR on each, return (concatenated text, pages_processed).
+    Scan the PDF and OCR page images.
+    Primary path: GPT-4o-mini vision OCR on rendered page images.
+    Optional fallback: local Tesseract OCR if GPT OCR fails.
+    Returns (concatenated text, pages_processed).
     """
     try:
         import fitz
@@ -100,61 +107,120 @@ def extract_images_and_ocr_text(
         logger.warning("PyMuPDF (fitz) not installed; cannot extract images from PDF")
         return "", 0
 
+    # Optional local OCR fallback.
+    pytesseract = None
+    Image = None
     try:
-        import pytesseract
-        from PIL import Image
-    except ImportError:
-        logger.warning("pytesseract or Pillow not installed; OCR disabled")
-        return "", 0
+        import pytesseract as _pytesseract
+        from PIL import Image as _Image
 
-    if settings.tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
+        pytesseract = _pytesseract
+        Image = _Image
+        if settings.tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
+    except ImportError:
+        pass
 
     text_parts: list[str] = []
+    client = None
+    model = None
+    try:
+        client, model = get_chat_client()
+    except Exception as e:
+        logger.warning("GPT OCR unavailable, will rely on local OCR fallback: %s", e)
+
     doc = fitz.open(stream=io.BytesIO(pdf_content), filetype="pdf")
 
     try:
-        seen_xrefs: set[int] = set()
         pages_to_process = min(len(doc), max_pages)
 
         for page_idx in range(pages_to_process):
             page = doc[page_idx]
-
-            # 1) Extract embedded images from page
-            for img_info in page.get_images():
-                xref = img_info[0]
-                if xref in seen_xrefs:
-                    continue
-                seen_xrefs.add(xref)
-                try:
-                    base_img = doc.extract_image(xref)
-                    img_bytes = base_img["image"]
-                    img_pil = Image.open(io.BytesIO(img_bytes))
-                    if img_pil.mode not in ("RGB", "L"):
-                        img_pil = img_pil.convert("RGB")
-                    ocr_text = pytesseract.image_to_string(img_pil).strip()
-                    if ocr_text:
-                        text_parts.append(f"[Page {page_idx + 1}] {ocr_text}")
-                except Exception as e:
-                    logger.debug("OCR failed for image xref=%s: %s", xref, e)
-
-            # 2) For pages with very little text, render whole page as image and OCR (scanned pages)
             page_text = page.get_text("text").strip()
-            if len(page_text) < 50:
+            has_images = bool(page.get_images())
+            should_ocr_page = has_images or len(page_text) < 50
+            if not should_ocr_page:
+                continue
+
+            # Render full page image and OCR with GPT.
+            ocr_text = ""
+            img_bytes = b""
+            try:
+                pix = page.get_pixmap(dpi=130, alpha=False)
+                img_bytes = pix.tobytes("png")
+                if client and model:
+                    ocr_text = _ocr_page_with_gpt(client, model, img_bytes, page_idx + 1)
+            except Exception as e:
+                logger.debug("GPT OCR render/call failed for page %s: %s", page_idx + 1, e)
+
+            # Optional local fallback if GPT OCR produced nothing.
+            if (not ocr_text) and img_bytes and pytesseract and Image:
                 try:
-                    pix = page.get_pixmap(dpi=150, alpha=False)
-                    img_bytes = pix.tobytes("png")
                     img_pil = Image.open(io.BytesIO(img_bytes))
                     if img_pil.mode not in ("RGB", "L"):
                         img_pil = img_pil.convert("RGB")
-                    ocr_text = pytesseract.image_to_string(img_pil).strip()
-                    if ocr_text:
-                        text_parts.append(f"[Page {page_idx + 1}] {ocr_text}")
+                    ocr_text = (pytesseract.image_to_string(img_pil) or "").strip()
                 except Exception as e:
-                    logger.debug("Page render OCR failed for page %s: %s", page_idx + 1, e)
+                    logger.debug("Local OCR fallback failed for page %s: %s", page_idx + 1, e)
+
+            if ocr_text:
+                text_parts.append(f"[Page {page_idx + 1}] {ocr_text}")
 
     finally:
         doc.close()
 
     result = "\n\n".join(text_parts)
     return (result[:100_000] if result else ""), pages_to_process
+
+
+def _ocr_page_with_gpt(client, model: str, image_bytes: bytes, page_number: int) -> str:
+    """Extract text from one rendered PDF page image using GPT vision."""
+    temp_key = None
+    image_url = None
+    if settings.s3_bucket:
+        temp_key = f"{TEMP_OCR_FOLDER}/ocr-page-{page_number}-{uuid.uuid4().hex}.png"
+        try:
+            s3_upload(image_bytes, temp_key, "image/png")
+            image_url = s3_download(temp_key, "image/png", expires_in=600)
+        except Exception as e:
+            logger.warning("Temporary OCR image upload failed for page %s: %s", page_number, e)
+            temp_key = None
+            image_url = None
+
+    if not image_url:
+        # Fallback when S3 is unavailable: inline data URI (higher token footprint).
+        data_b64 = base64.b64encode(image_bytes).decode("ascii")
+        image_url = f"data:image/png;base64,{data_b64}"
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an OCR engine. Extract all visible text from the given document page image. "
+                "Return plain text only. Preserve reading order and line breaks. "
+                "Do not summarize, explain, or add markdown."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"Extract all text from this PDF page image (page {page_number})."},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        },
+    ]
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=4000,
+            timeout=120.0,
+        )
+        out = ((resp.choices[0].message.content or "") if resp and resp.choices else "").strip()
+        return out
+    finally:
+        if temp_key:
+            try:
+                s3_delete(temp_key)
+            except Exception as e:
+                logger.warning("Failed to delete temporary OCR image %s: %s", temp_key, e)

@@ -60,6 +60,7 @@ class UserResponse(BaseModel):
     role: UserRole
     is_active: bool
     created_at: datetime
+    vector_database: str | None = None
 
     @field_validator("is_active", mode="before")
     @classmethod
@@ -105,6 +106,21 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class CollaborationUserOut(BaseModel):
+    """Minimal user fields for RFP collaborator picker (id, name, email)."""
+
+    id: str
+    name: str
+    email: str
+
+
+class UserVectorDatabaseResponse(BaseModel):
+    """After provisioning, Qdrant collection name stored on the user as vector_database."""
+
+    vector_database: str
+    message: str = "Vector database collection is ready."
 
 
 class TokenResponse(BaseModel):
